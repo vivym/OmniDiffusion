@@ -1,0 +1,20 @@
+[tool.poetry]
+name = "omni-diffusion"
+version = "0.1.0"
+description = ""
+authors = ["Ming Yang <vivym@live.com>"]
+readme = "README.md"
+packages = [{include = "omni_diffusion"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+accelerate = "^0.21.0"
+datasets = "^2.14.4"
+transformers = "^4.31.0"
+diffusers = "^0.20.0"
+jsonargparse = {extras = ["argcomplete", "signatures", "urls"], version = "^4.23.1"}
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
