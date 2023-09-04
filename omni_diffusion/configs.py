@@ -31,14 +31,18 @@ class OptimizerConfig:
 
     learning_rate: float = 1e-4
 
+    auto_scale_lr: bool = False
+
+    use_8bit_adam: bool = False
+
     weight_decay: float = 1e-2
 
     adam_beta: tuple[float, float] = (0.9, 0.999)
 
     adam_epsilon: float = 1e-8
 
-    # The scheduler type to use. Choose between ["linear", "cosine", 
-    # "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
+    # The scheduler type to use.
+    # Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
     lr_scheduler: str | None = None
 
     lr_warmup_steps: int = 500
@@ -46,6 +50,8 @@ class OptimizerConfig:
 
 @dataclass
 class TrainerConfig:
+    project_name: str = "omni-diffusion"
+
     output_dir: str = "./outputs"
 
     max_epochs: int = 10
@@ -92,7 +98,7 @@ class TrainerConfig:
 
     mixed_precision: str | None = None      # no, fp16, bf16
 
-    use_xformers_mean: bool = False
+    use_xformers: bool = False
 
     # The scale of noise offset.
     noise_offset: float = 0.0
