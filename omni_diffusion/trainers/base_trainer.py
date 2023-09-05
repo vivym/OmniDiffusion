@@ -8,6 +8,7 @@ import diffusers
 import torch
 import transformers
 from accelerate import Accelerator
+from accelerate.logging import get_logger
 from accelerate.state import AcceleratorState
 from accelerate.utils import ProjectConfiguration, set_seed
 from diffusers.optimization import get_scheduler
@@ -16,7 +17,7 @@ from omni_diffusion.configs import (
     DataConfig, ModelConfig, OptimizerConfig
 )
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, log_level="INFO")
 
 
 def deepspeed_zero_init_disabled_context_manager():
@@ -52,7 +53,7 @@ class BaseTrainer(abc.ABC):
         max_grad_norm: float = 1.0,
         use_ema: bool = False,
         prediction_type: str | None = None,
-        mixed_precision: bool = False,
+        mixed_precision: str | None = None,
         use_xformers: bool = False,
         noise_offset: float = 0.0,
         proportion_empty_prompts: float = 0.0,
@@ -60,6 +61,7 @@ class BaseTrainer(abc.ABC):
         force_snr_gamma: bool = False,
         push_to_hub: bool = False,
         hub_model_id: str | None = None,
+        report_to: str = "tensorboard",
     ) -> None:
         self.max_epochs = max_epochs
         self.max_steps = max_steps
@@ -88,6 +90,7 @@ class BaseTrainer(abc.ABC):
         self.force_snr_gamma = force_snr_gamma
         self.push_to_hub = push_to_hub
         self.hub_model_id = hub_model_id
+        self.report_to = report_to
 
     def fit(
         self,
@@ -133,7 +136,7 @@ class BaseTrainer(abc.ABC):
             gradient_accumulation_steps=self.gradient_accumulation_steps,
             mixed_precision=self.mixed_precision,
             project_config=project_config,
-            log_with="tensorboard", # TODO: support more loggers
+            log_with=self.report_to,
         )
 
         # Make one log on every process with the configuration for debugging.

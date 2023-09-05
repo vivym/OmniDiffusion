@@ -1,10 +1,16 @@
 data:
-  ...
+  dataset_name: "./data/mj-52-512x512"
+  image_column: "image"
+  caption_column: "improved_prompt"
+  random_flip: True
 
 model:
-  model_name_or_path: ""
-  revision: ""
-  
+  model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
 
-accelerate:
-  ...
+optimizer:
+  lr_scheduler: constant_with_warmup
+
+trainer:
+  class_path: omni_diffusion.trainers.sdxl_trainer.SDXLTrainer
+  init_args:
+    project_name: "od-debug"

@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from accelerate.logging import get_logger
 from datasets import load_dataset
 from diffusers import (
     AutoencoderKL,
@@ -30,9 +31,9 @@ from transformers import AutoTokenizer, PretrainedConfig, PreTrainedModel
 from omni_diffusion.configs import (
     DataConfig, ModelConfig, OptimizerConfig
 )
-from .base_trainer import BaseTrainer, deepspeed_zero_init_disabled_context_manager
+from .base_trainer import BaseTrainer
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__, log_level="INFO")
 
 
 def import_model_class_from_model_name_or_path(
@@ -126,7 +127,7 @@ def encode_prompt(
     return prompt_embeds, pooled_prompt_embeds
 
 
-class StableDiffusionTrainer(BaseTrainer):
+class SDXLTrainer(BaseTrainer):
     def fit(
         self,
         data_config: DataConfig,
@@ -559,6 +560,7 @@ class StableDiffusionTrainer(BaseTrainer):
                     pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(accelerator.device)
                     unet_added_conditions.update({"text_embeds": pooled_prompt_embeds})
                     prompt_embeds = prompt_embeds
+
                     model_pred = unet(
                         noisy_model_input,
                         timesteps,
@@ -696,6 +698,8 @@ class StableDiffusionTrainer(BaseTrainer):
                             np_images = np.stack([np.asarray(img) for img in images])
                             tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
                         if tracker.name == "wandb":
+                            import wandb
+
                             tracker.log(
                                 {
                                     "validation": [

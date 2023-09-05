@@ -8,6 +8,7 @@ from jsonargparse import ArgumentParser, ActionConfigFile
 from .configs import (
     DataConfig, ModelConfig, OptimizerConfig, TrainerConfig, LoggingConfig, HubConfig
 )
+from .trainers import BaseTrainer
 
 if TYPE_CHECKING:
     from jsonargparse._actions import _ActionSubCommands
@@ -91,12 +92,9 @@ class OmniCLI:
         config = self.config_instantiated[subcommand]
         # Run subcomman
         getattr(self.trainer, subcommand)(
-            data=config["data"],
-            model=config["model"],
-            optimizer=config["optimizer"],
-            trainer=config["trainer"],
-            logging=config["logging"],
-            hub=config["hub"],
+            data_config=config["data"],
+            model_config=config["model"],
+            optimizer_config=config["optimizer"],
         )
 
     def add_subcommand(
@@ -133,9 +131,16 @@ class OmniCLI:
             nested_key="optimizer",
         )
 
-        parser.add_dataclass_arguments(
-            TrainerConfig,
+        # parser.add_dataclass_arguments(
+        #     TrainerConfig,
+        #     nested_key="trainer",
+        # )
+
+        parser.add_subclass_arguments(
+            BaseTrainer,
             nested_key="trainer",
+            required=True,
+            fail_untyped=False,
         )
 
         parser.add_dataclass_arguments(

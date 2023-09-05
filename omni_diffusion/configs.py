@@ -27,8 +27,6 @@ class ModelConfig:
 
 @dataclass
 class OptimizerConfig:
-    optimizer_name: str
-
     learning_rate: float = 1e-4
 
     auto_scale_lr: bool = False
@@ -107,6 +105,8 @@ class TrainerConfig:
     proportion_empty_prompts: float = 0.0
 
     seed: bool | int = True
+
+    report_to: str = "tensorboard"
 
 
 @dataclass
