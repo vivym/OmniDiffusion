@@ -164,7 +164,7 @@ class BaseTrainer(abc.ABC):
     ):
         ...
 
-    def setup_accelerator(self):
+    def setup_accelerator(self) -> Accelerator:
         logging_dir = os.path.join(self.output_dir, self.logging_dir)
 
         project_config = ProjectConfiguration(

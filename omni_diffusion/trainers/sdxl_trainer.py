@@ -8,6 +8,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from accelerate import Accelerator
 from accelerate.logging import get_logger
 from datasets import load_dataset
 from diffusers import (
@@ -86,6 +87,36 @@ def compute_vae_encodings(batch, vae: AutoencoderKL) -> torch.Tensor:
     return model_input * vae.config.scaling_factor
 
 
+def encode_prompts(
+    batch,
+    text_encoder_one: PreTrainedModel,
+    text_encoder_two: PreTrainedModel,
+    train_text_encoder: bool,
+):
+    prompt_embeds_list = []
+
+    input_ids_list = [batch["input_ids_one"], batch["input_ids_two"]]
+    text_encoders = [text_encoder_one, text_encoder_two]
+
+    with torch.set_grad_enabled(train_text_encoder):
+        for input_ids, text_encoder in zip(input_ids_list, text_encoders):
+            prompt_embeds = text_encoder(
+                input_ids=input_ids.to(text_encoder.device),
+                output_hidden_states=True,
+            )
+            # We are only ALWAYS interested in the pooled output of the final text encoder
+            pooled_prompt_embeds = prompt_embeds[0]
+            prompt_embeds = prompt_embeds.hidden_states[-2]
+            bs_embed, seq_len, _ = prompt_embeds.shape
+            prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
+            prompt_embeds_list.append(prompt_embeds)
+
+    prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
+    pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
+
+    return prompt_embeds, pooled_prompt_embeds
+
+
 @torch.jit.script
 def compute_snr(
     timesteps: torch.Tensor,
@@ -110,39 +141,6 @@ def compute_snr(
     # Compute SNR.
     snr = (alpha / sigma) ** 2
     return snr
-
-
-def encode_prompts(
-    batch,
-    text_encoder_one: PreTrainedModel,
-    text_encoder_two: PreTrainedModel,
-    proportion_empty_prompts: float = 0.0,
-    is_train: bool = True,
-):
-    # TODO: proportion_empty_prompts
-
-    prompt_embeds_list = []
-
-    input_ids_list = [batch["input_ids_one"], batch["input_ids_two"]]
-    text_encoders = [text_encoder_one, text_encoder_two]
-
-    with torch.no_grad():
-        for input_ids, text_encoder in zip(input_ids_list, text_encoders):
-            prompt_embeds = text_encoder(
-                input_ids=input_ids.to(text_encoder.device),
-                output_hidden_states=True,
-            )
-            # We are only ALWAYS interested in the pooled output of the final text encoder
-            pooled_prompt_embeds = prompt_embeds[0]
-            prompt_embeds = prompt_embeds.hidden_states[-2]
-            bs_embed, seq_len, _ = prompt_embeds.shape
-            prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
-            prompt_embeds_list.append(prompt_embeds)
-
-    prompt_embeds = torch.concat(prompt_embeds_list, dim=-1)
-    pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
-
-    return prompt_embeds, pooled_prompt_embeds
 
 
 class SDXLTrainer(BaseTrainer):
@@ -191,13 +189,13 @@ class SDXLTrainer(BaseTrainer):
             model_config.model_name_or_path,
             revision=model_config.revision,
             subfolder="tokenizer",
-            use_fast=True, # TODO: support fast tokenizers
+            use_fast=True,
         )
         tokenizer_two = AutoTokenizer.from_pretrained(
             model_config.model_name_or_path,
             revision=model_config.revision,
             subfolder="tokenizer_2",
-            use_fast=True, # TODO: support fast tokenizers
+            use_fast=True,
         )
 
         # import text encoder classes
@@ -244,6 +242,10 @@ class SDXLTrainer(BaseTrainer):
             # We only train the additional adapter LoRA layers.
             unet.requires_grad_(False)
 
+        vae.eval()
+        text_encoder_one.eval()
+        text_encoder_two.eval()
+
         # For mixed precision training we cast all non-trainable weigths to half-precision
         # as these weights are only used for inference, keeping weights in full precision is not required.
         if self.mixed_precision == "fp16":
@@ -264,15 +266,15 @@ class SDXLTrainer(BaseTrainer):
         if self.use_ema:
             assert not self.use_lora, "EMA is not supported with LoRA"
 
-            ema_unet_base = UNet2DConditionModel.from_pretrained(
+            ema_unet_base: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(
                 model_config.model_name_or_path,
                 revision=model_config.revision,
                 subfolder="unet",
             )
             ema_unet = EMAModel(
-                ema_unet_base,
+                ema_unet_base.parameters(),
                 model_cls=UNet2DConditionModel,
-                model_config = ema_unet_base.config,
+                model_config=ema_unet_base.config,
             )
 
         if self.use_xformers:
@@ -462,11 +464,15 @@ class SDXLTrainer(BaseTrainer):
             ),
         ])
 
-        def tokenize_captions(samples, is_train: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+        def tokenize_captions(
+            samples, proportion_empty_prompts: float = 0.0, is_train: bool = True
+        ) -> tuple[torch.Tensor, torch.Tensor]:
             captions = []
 
             for caption in samples[data_config.caption_column]:
-                if isinstance(caption, str):
+                if is_train and random.random() < proportion_empty_prompts:
+                    captions.append("")
+                elif isinstance(caption, str):
                     captions.append(caption)
                 elif isinstance(caption, (list, np.ndarray)):
                     captions.append(random.choice(caption) if is_train else caption[0])
@@ -524,11 +530,15 @@ class SDXLTrainer(BaseTrainer):
             return all_images, original_sizes, crop_top_lefts
 
         def preprocess_train(samples):
-            input_ids_one, input_ids_two = tokenize_captions(samples)
+            input_ids_one, input_ids_two = tokenize_captions(
+                samples,
+                proportion_empty_prompts=self.proportion_empty_prompts,
+                is_train=True,
+            )
             samples["input_ids_one"] = input_ids_one
             samples["input_ids_two"] = input_ids_two
 
-            images, original_sizes, crop_top_lefts = preprocess_images(samples)
+            images, original_sizes, crop_top_lefts = preprocess_images(samples, is_train=True)
             samples["pixel_values"] = images
             samples["original_sizes"] = original_sizes
             samples["crop_top_lefts"] = crop_top_lefts
@@ -655,7 +665,7 @@ class SDXLTrainer(BaseTrainer):
         progress_bar = tqdm(
             range(global_step, self.max_steps),
             desc="Steps",
-            disable=not accelerator.is_local_main_process
+            disable=not accelerator.is_local_main_process,
         )
 
         for epoch in range(first_epoch, self.max_epochs):
@@ -672,29 +682,6 @@ class SDXLTrainer(BaseTrainer):
                         progress_bar.update(1)
                     continue
 
-                prompt_embeds, pooled_prompt_embeds = encode_prompts(
-                    batch,
-                    text_encoder_one=text_encoder_one,
-                    text_encoder_two=text_encoder_two,
-                )
-
-                model_input = compute_vae_encodings(batch, vae)
-                noise = torch.randn_like(model_input)
-                if self.noise_offset:
-                    # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    noise += self.noise_offset * torch.randn(
-                        (model_input.shape[0], model_input.shape[1], 1, 1),
-                        device=model_input.device,
-                    )
-
-                bsz = model_input.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, (bsz,),
-                    device=model_input.device,
-                )
-                timesteps = timesteps.long()
-
                 # time ids
                 def compute_time_ids(original_size, crops_coords_top_left):
                     # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
@@ -705,6 +692,30 @@ class SDXLTrainer(BaseTrainer):
                     return add_time_ids
 
                 with accelerator.accumulate(unet):
+                    prompt_embeds, pooled_prompt_embeds = encode_prompts(
+                        batch,
+                        text_encoder_one=text_encoder_one,
+                        text_encoder_two=text_encoder_two,
+                        train_text_encoder=self.train_text_encoder,
+                    )
+
+                    model_input = compute_vae_encodings(batch, vae)
+                    noise = torch.randn_like(model_input)
+                    if self.noise_offset:
+                        # https://www.crosslabs.org//blog/diffusion-with-offset-noise
+                        noise += self.noise_offset * torch.randn(
+                            (model_input.shape[0], model_input.shape[1], 1, 1),
+                            device=model_input.device,
+                        )
+
+                    bsz = model_input.shape[0]
+                    # Sample a random timestep for each image
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps, (bsz,),
+                        device=model_input.device,
+                    )
+                    timesteps = timesteps.long()
+
                     # Add noise to the model input according to the noise magnitude at each timestep
                     # (this is the forward diffusion process)
                     noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
@@ -777,6 +788,9 @@ class SDXLTrainer(BaseTrainer):
                     lr_scheduler.step()
                     optimizer.zero_grad()
 
+                logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+                progress_bar.set_postfix(**logs)
+
                 # Checks if the accelerator has performed an optimization step behind the scenes
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
@@ -798,7 +812,8 @@ class SDXLTrainer(BaseTrainer):
                                     removing_checkpoints = checkpoints[0:num_to_remove]
 
                                     logger.info(
-                                        f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                        f"{len(checkpoints)} checkpoints already exist, "
+                                        "removing {len(removing_checkpoints)} checkpoints"
                                     )
                                     logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
 
@@ -810,79 +825,24 @@ class SDXLTrainer(BaseTrainer):
                             accelerator.save_state(save_path)
                             logger.info(f"Saved state to {save_path}")
 
-                logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
-                progress_bar.set_postfix(**logs)
+                        if global_step % self.validation_every_n_steps == 0:
+                            self._validation_step(
+                                global_step,
+                                accelerator=accelerator,
+                                model_config=model_config,
+                                text_encoder_one=text_encoder_one,
+                                text_encoder_two=text_encoder_two,
+                                vae=vae,
+                                unet=unet,
+                                ema_unet=ema_unet,
+                                weight_dtype=weight_dtype,
+                            )
 
                 if global_step >= self.max_steps:
                     break
 
-            if accelerator.is_main_process:
-                # TODO: validation_every_n_steps
-                if self.validation_prompt is not None and epoch % self.validation_every_n_steps == 0:
-                    logger.info(
-                        f"Running validation... \n Generating {self.num_validation_samples} images with prompt:"
-                        f" {self.validation_prompt}."
-                    )
-                    if self.use_ema:
-                        # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
-                        ema_unet.store(unet.parameters())
-                        ema_unet.copy_to(unet.parameters())
-
-                    # create pipeline
-                    # vae = AutoencoderKL.from_pretrained(
-                    #     model_config.model_name_or_path,
-                    #     revision=model_config.revision,
-                    #     subfolder="vae",
-                    # )
-                    pipeline = StableDiffusionXLPipeline.from_pretrained(
-                        model_config.model_name_or_path,
-                        vae=vae,
-                        text_encoder=accelerator.unwrap_model(text_encoder_one),
-                        text_encoder_2=accelerator.unwrap_model(text_encoder_two),
-                        unet=accelerator.unwrap_model(unet),
-                        revision=model_config.revision,
-                        torch_dtype=weight_dtype,
-                    )
-                    if self.prediction_type is not None:
-                        scheduler_args = {"prediction_type": self.prediction_type}
-                        pipeline.scheduler = pipeline.scheduler.from_config(
-                            pipeline.scheduler.config,
-                            **scheduler_args,
-                        )
-
-                    pipeline = pipeline.to(accelerator.device)
-                    pipeline.set_progress_bar_config(disable=True)
-
-                    # run inference
-                    generator = torch.Generator(device=accelerator.device).manual_seed(self.seed) if self.seed else None
-                    pipeline_args = {"prompt": self.validation_prompt}
-
-                    with torch.cuda.amp.autocast():
-                        images = [
-                            pipeline(**pipeline_args, generator=generator).images[0]
-                            for _ in range(self.num_validation_samples)
-                        ]
-
-                    for tracker in accelerator.trackers:
-                        if tracker.name == "tensorboard":
-                            np_images = np.stack([np.asarray(img) for img in images])
-                            tracker.writer.add_images("validation", np_images, epoch, dataformats="NHWC")
-                        if tracker.name == "wandb":
-                            import wandb
-
-                            tracker.log(
-                                {
-                                    "validation": [
-                                        wandb.Image(image, caption=f"{i}: {self.validation_prompt}")
-                                        for i, image in enumerate(images)
-                                    ]
-                                }
-                            )
-
-                    del pipeline
-                    torch.cuda.empty_cache()
-
         accelerator.wait_for_everyone()
+
         if accelerator.is_main_process:
             unet = accelerator.unwrap_model(unet)
             if self.use_ema:
@@ -921,16 +881,10 @@ class SDXLTrainer(BaseTrainer):
                 )
                 pipeline = pipeline.to(accelerator.device)
 
-                # load attention processors
+                # Load attention processors
                 pipeline.load_lora_weights(self.output_dir)
             else:
                 # Serialize pipeline.
-                vae = AutoencoderKL.from_pretrained(
-                    model_config.model_name_or_path,
-                    revision=model_config.revision,
-                    subfolder="vae",
-                    torch_dtype=weight_dtype,
-                )
                 pipeline = StableDiffusionXLPipeline.from_pretrained(
                     model_config.model_name_or_path,
                     unet=unet,
@@ -944,29 +898,8 @@ class SDXLTrainer(BaseTrainer):
                 pipeline.save_pretrained(self.output_dir)
 
             # run inference
-            images = []
-            if self.validation_prompt and self.num_validation_samples > 0:
-                pipeline = pipeline.to(accelerator.device)
-                generator = torch.Generator(device=accelerator.device).manual_seed(self.seed) if self.seed else None
-                with torch.cuda.amp.autocast():
-                    images = [
-                        pipeline(self.validation_prompt, generator=generator).images[0]
-                        for _ in range(self.num_validation_samples)
-                    ]
-
-                for tracker in accelerator.trackers:
-                    if tracker.name == "tensorboard":
-                        np_images = np.stack([np.asarray(img) for img in images])
-                        tracker.writer.add_images("test", np_images, epoch, dataformats="NHWC")
-                    if tracker.name == "wandb":
-                        tracker.log(
-                            {
-                                "test": [
-                                    wandb.Image(image, caption=f"{i}: {self.validation_prompt}")
-                                    for i, image in enumerate(images)
-                                ]
-                            }
-                        )
+            pipeline = pipeline.to(accelerator.device)
+            images = self._inference_step(global_step, accelerator, pipeline, stage="test")
 
             if self.push_to_hub:
                 # save_model_card(
@@ -986,6 +919,94 @@ class SDXLTrainer(BaseTrainer):
                 )
 
         accelerator.end_training()
+
+    def _validation_step(
+        self,
+        current_step: int,
+        accelerator: Accelerator,
+        model_config: ModelConfig,
+        text_encoder_one: PreTrainedModel,
+        text_encoder_two: PreTrainedModel,
+        vae: AutoencoderKL,
+        unet: UNet2DConditionModel,
+        ema_unet: EMAModel,
+        weight_dtype: torch.dtype,
+    ):
+        if not accelerator.is_main_process or not self.validation_prompt or self.num_validation_samples == 0:
+            return
+
+        logger.info(
+            f"Running validation... \n Generating {self.num_validation_samples} images with prompt:"
+            f" {self.validation_prompt}."
+        )
+        if self.use_ema:
+            # Store the UNet parameters temporarily and load the EMA parameters to perform inference.
+            ema_unet.store(unet.parameters())
+            ema_unet.copy_to(unet.parameters())
+
+        # create pipeline
+        pipeline = StableDiffusionXLPipeline.from_pretrained(
+            model_config.model_name_or_path,
+            vae=vae,
+            text_encoder=accelerator.unwrap_model(text_encoder_one),
+            text_encoder_2=accelerator.unwrap_model(text_encoder_two),
+            unet=accelerator.unwrap_model(unet),
+            revision=model_config.revision,
+            torch_dtype=weight_dtype,
+        )
+        if self.prediction_type is not None:
+            scheduler_args = {"prediction_type": self.prediction_type}
+            pipeline.scheduler = pipeline.scheduler.from_config(
+                pipeline.scheduler.config,
+                **scheduler_args,
+            )
+
+        pipeline = pipeline.to(accelerator.device)
+        pipeline.set_progress_bar_config(disable=True)
+
+        self._inference_step(current_step, accelerator, pipeline, stage="validation")
+
+        del pipeline
+        torch.cuda.empty_cache()
+
+        ema_unet.restore(unet.parameters())
+
+    def _inference_step(
+        self,
+        current_step: int,
+        accelerator: Accelerator,
+        pipeline: StableDiffusionXLPipeline,
+        stage: str = "validation",
+    ):
+        if not accelerator.is_main_process or not self.validation_prompt or self.num_validation_samples == 0:
+            return []
+
+        generator = torch.Generator(device=accelerator.device).manual_seed(self.seed) if self.seed else None
+        pipeline_args = {"prompt": self.validation_prompt}
+
+        with torch.cuda.amp.autocast():
+            images = [
+                pipeline(**pipeline_args, generator=generator).images[0]
+                for _ in range(self.num_validation_samples)
+            ]
+
+        for tracker in accelerator.trackers:
+            if tracker.name == "tensorboard":
+                np_images = np.stack([np.asarray(img) for img in images])
+                tracker.writer.add_images(stage, np_images, current_step, dataformats="NHWC")
+            if tracker.name == "wandb":
+                import wandb
+
+                tracker.log(
+                    {
+                        stage: [
+                            wandb.Image(image, caption=f"{i}: {self.validation_prompt}")
+                            for i, image in enumerate(images)
+                        ]
+                    }
+                )
+
+        return images
 
     def validate(self):
         ...
