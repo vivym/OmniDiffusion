@@ -34,6 +34,9 @@ def deepspeed_zero_init_disabled_context_manager():
 class BaseTrainer(abc.ABC):
     def __init__(
         self,
+        project_name: str = "omni-diffusion",
+        output_dir: str = "./outputs",
+        logging_dir: str = "logs",
         max_epochs: int = 1,
         max_steps: int | None = None,
         train_batch_size: int = 16,
@@ -45,9 +48,6 @@ class BaseTrainer(abc.ABC):
         checkpointing_every_n_steps: int = 500,
         max_checkpoints: int | None = None,
         resume_from_checkpoint: str | None = None,
-        project_name: str = "omni-diffusion",
-        output_dir: str = "./outputs",
-        logging_dir: str = "logs",
         allow_tf32: bool = False,
         seed: int | None = None,
         max_grad_norm: float = 1.0,
@@ -66,6 +66,9 @@ class BaseTrainer(abc.ABC):
         lora_rank: int = 4,
         train_text_encoder: bool = False,
     ) -> None:
+        self.project_name = project_name
+        self.output_dir = output_dir
+        self.logging_dir = logging_dir
         self.max_epochs = max_epochs
         self.max_steps = max_steps
         self.train_batch_size = train_batch_size
@@ -77,9 +80,6 @@ class BaseTrainer(abc.ABC):
         self.checkpointing_every_n_steps = checkpointing_every_n_steps
         self.max_checkpoints = max_checkpoints
         self.resume_from_checkpoint = resume_from_checkpoint
-        self.project_name = project_name
-        self.output_dir = output_dir
-        self.logging_dir = logging_dir
         self.allow_tf32 = allow_tf32
         self.seed = seed
         self.max_grad_norm = max_grad_norm
