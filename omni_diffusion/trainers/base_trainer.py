@@ -62,6 +62,9 @@ class BaseTrainer(abc.ABC):
         push_to_hub: bool = False,
         hub_model_id: str | None = None,
         report_to: str = "tensorboard",
+        use_lora: bool = False,
+        lora_rank: int = 4,
+        train_text_encoder: bool = False,
     ) -> None:
         self.max_epochs = max_epochs
         self.max_steps = max_steps
@@ -91,6 +94,43 @@ class BaseTrainer(abc.ABC):
         self.push_to_hub = push_to_hub
         self.hub_model_id = hub_model_id
         self.report_to = report_to
+        self.use_lora = use_lora
+        self.lora_rank = lora_rank
+        self.train_text_encoder = train_text_encoder
+
+        self.config = {
+            "max_epochs": self.max_epochs,
+            "max_steps": self.max_steps,
+            "train_batch_size": self.train_batch_size,
+            "validation_every_n_steps": self.validation_every_n_steps,
+            "validation_prompt": self.validation_prompt,
+            "num_validation_samples": self.num_validation_samples,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "gradient_checkpointing": self.gradient_checkpointing,
+            "checkpointing_every_n_steps": self.checkpointing_every_n_steps,
+            "max_checkpoints": self.max_checkpoints,
+            "resume_from_checkpoint": self.resume_from_checkpoint,
+            "project_name": self.project_name,
+            "output_dir": self.output_dir,
+            "logging_dir": self.logging_dir,
+            "allow_tf32": self.allow_tf32,
+            "seed": self.seed,
+            "max_grad_norm": self.max_grad_norm,
+            "use_ema": self.use_ema,
+            "prediction_type": self.prediction_type,
+            "mixed_precision": self.mixed_precision,
+            "use_xformers": self.use_xformers,
+            "noise_offset": self.noise_offset,
+            "proportion_empty_prompts": self.proportion_empty_prompts,
+            "snr_gamma": self.snr_gamma,
+            "force_snr_gamma": self.force_snr_gamma,
+            "push_to_hub": self.push_to_hub,
+            "hub_model_id": self.hub_model_id,
+            "report_to": self.report_to,
+            "use_lora": self.use_lora,
+            "lora_rank": self.lora_rank,
+            "train_text_encoder": self.train_text_encoder,
+        }
 
     def fit(
         self,

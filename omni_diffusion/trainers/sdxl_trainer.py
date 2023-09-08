@@ -1,9 +1,9 @@
 import math
 import os
 import io
+import itertools
 import random
 import shutil
-import logging
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +16,8 @@ from diffusers import (
     StableDiffusionXLPipeline,
     UNet2DConditionModel,
 )
+from diffusers.loaders import LoraLoaderMixin, text_encoder_lora_state_dict
+from diffusers.models.attention_processor import LoRAAttnProcessor, LoRAAttnProcessor2_0
 from diffusers.training_utils import EMAModel
 from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import create_repo, upload_folder
@@ -60,6 +62,22 @@ def import_model_class_from_model_name_or_path(
         raise ValueError(f"Unknown text encoder class: {model_class}")
 
 
+def unet_attn_processors_state_dict(unet: UNet2DConditionModel) -> dict[str, torch.Tensor]:
+    """
+    Returns:
+        a state dict containing just the attention processor parameters.
+    """
+    attn_processors = unet.attn_processors
+
+    attn_processors_state_dict = {}
+
+    for attn_processor_key, attn_processor in attn_processors.items():
+        for parameter_key, parameter in attn_processor.state_dict().items():
+            attn_processors_state_dict[f"{attn_processor_key}.{parameter_key}"] = parameter
+
+    return attn_processors_state_dict
+
+
 def compute_vae_encodings(batch, vae: AutoencoderKL) -> torch.Tensor:
     pixel_values = batch.pop("pixel_values")
 
@@ -94,7 +112,7 @@ def compute_snr(
     return snr
 
 
-def encode_prompt(
+def encode_prompts(
     batch,
     text_encoder_one: PreTrainedModel,
     text_encoder_two: PreTrainedModel,
@@ -148,20 +166,6 @@ class SDXLTrainer(BaseTrainer):
 
         accelerator.wait_for_everyone()
 
-        # Load the tokenizers.
-        tokenizer_one = AutoTokenizer.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.revision,
-            subfolder="tokenizer",
-            use_fast=True, # TODO: support fast tokenizers
-        )
-        tokenizer_two = AutoTokenizer.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.revision,
-            subfolder="tokenizer_2",
-            use_fast=True, # TODO: support fast tokenizers
-        )
-
         # Load scheduler and models.
         noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
             model_config.model_name_or_path,
@@ -181,6 +185,20 @@ class SDXLTrainer(BaseTrainer):
                 "When this configuration is present, the parameter `snr_gamma` may not be used without parameter `force_snr_gamma`.\n"
                 "This is due to a mathematical incompatibility between our current SNR gamma implementation, and a sigma value of zero."
             )
+
+        # Load the tokenizers.
+        tokenizer_one = AutoTokenizer.from_pretrained(
+            model_config.model_name_or_path,
+            revision=model_config.revision,
+            subfolder="tokenizer",
+            use_fast=True, # TODO: support fast tokenizers
+        )
+        tokenizer_two = AutoTokenizer.from_pretrained(
+            model_config.model_name_or_path,
+            revision=model_config.revision,
+            subfolder="tokenizer_2",
+            use_fast=True, # TODO: support fast tokenizers
+        )
 
         # import text encoder classes
         text_encode_cls_one = import_model_class_from_model_name_or_path(
@@ -222,6 +240,9 @@ class SDXLTrainer(BaseTrainer):
         vae.requires_grad_(False)
         text_encoder_one.requires_grad_(False)
         text_encoder_two.requires_grad_(False)
+        if self.use_lora:
+            # We only train the additional adapter LoRA layers.
+            unet.requires_grad_(False)
 
         # For mixed precision training we cast all non-trainable weigths to half-precision
         # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -237,7 +258,12 @@ class SDXLTrainer(BaseTrainer):
         text_encoder_one.to(accelerator.device, dtype=weight_dtype)
         text_encoder_two.to(accelerator.device, dtype=weight_dtype)
 
+        if self.use_lora:
+            unet.to(accelerator.device, dtype=weight_dtype)
+
         if self.use_ema:
+            assert not self.use_lora, "EMA is not supported with LoRA"
+
             ema_unet_base = UNet2DConditionModel.from_pretrained(
                 model_config.model_name_or_path,
                 revision=model_config.revision,
@@ -264,45 +290,143 @@ class SDXLTrainer(BaseTrainer):
             else:
                 raise ValueError("xformers is not available. Make sure it is installed correctly")
 
-        # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-        def save_model_hook(
-            models: list[UNet2DConditionModel],
-            weights: list[torch.Tensor],
-            output_dir: str,
-        ):
-            if self.use_ema:
-                ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+        if self.use_lora:
+            # now we will add new LoRA weights to the attention layers
+            # Set correct lora layers
+            unet_lora_attn_procs = {}
+            unet_lora_parameters = []
+            for name, attn_processor in unet.attn_processors.items():
+                cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+                if name.startswith("mid_block"):
+                    hidden_size = unet.config.block_out_channels[-1]
+                elif name.startswith("up_blocks"):
+                    block_id = int(name[len("up_blocks.")])
+                    hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+                elif name.startswith("down_blocks"):
+                    block_id = int(name[len("down_blocks.")])
+                    hidden_size = unet.config.block_out_channels[block_id]
 
-            for model in models:
-                model.save_pretrained(os.path.join(output_dir, "unet"))
-
-                # make sure to pop weight so that corresponding model is not saved again
-                weights.pop()
-
-        def load_model_hook(models: list[UNet2DConditionModel], input_dir: str):
-            if self.use_ema:
-                loaded_model = EMAModel.from_pretrained(
-                    os.path.join(input_dir, "unet_ema"), UNet2DConditionModel
+                lora_attn_processor_class = (
+                    LoRAAttnProcessor2_0 if hasattr(F, "scaled_dot_product_attention") else LoRAAttnProcessor
                 )
-                ema_unet.load_state_dict(loaded_model.state_dict())
-                ema_unet.to(accelerator.device)
-                del loaded_model
+                module = lora_attn_processor_class(
+                    hidden_size=hidden_size,
+                    cross_attention_dim=cross_attention_dim,
+                    rank=self.lora_rank,
+                )
+                unet_lora_attn_procs[name] = module
+                unet_lora_parameters.extend(module.parameters())
 
-            for _ in range(len(models)):
-                # pop models so that they are not loaded again
-                model = models.pop()
+            unet.set_attn_processor(unet_lora_attn_procs)
 
-                loaded_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
-                model.register_to_config(**loaded_model.config)
+            if self.train_text_encoder:
+                # ensure that dtype is float32, even if rest of the model that isn't trained is loaded in fp16
+                text_lora_parameters_one = LoraLoaderMixin._modify_text_encoder(
+                    text_encoder_one, dtype=torch.float32, rank=self.lora_rank
+                )
+                text_lora_parameters_two = LoraLoaderMixin._modify_text_encoder(
+                    text_encoder_two, dtype=torch.float32, rank=self.lora_rank
+                )
 
-                model.load_state_dict(loaded_model.state_dict())
-                model.to(accelerator.device)
-                del loaded_model
+            # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+            def save_model_hook(models, weights, output_dir):
+                # there are only two options here. Either are just the unet attn processor layers
+                # or there are the unet and text encoder atten layers
+                unet_lora_layers_to_save = None
+                text_encoder_one_lora_layers_to_save = None
+                text_encoder_two_lora_layers_to_save = None
+
+                for model in models:
+                    if isinstance(model, type(accelerator.unwrap_model(unet))):
+                        unet_lora_layers_to_save = unet_attn_processors_state_dict(model)
+                    elif isinstance(model, type(accelerator.unwrap_model(text_encoder_one))):
+                        text_encoder_one_lora_layers_to_save = text_encoder_lora_state_dict(model)
+                    elif isinstance(model, type(accelerator.unwrap_model(text_encoder_two))):
+                        text_encoder_two_lora_layers_to_save = text_encoder_lora_state_dict(model)
+                    else:
+                        raise ValueError(f"unexpected save model: {model.__class__}")
+
+                    # make sure to pop weight so that corresponding model is not saved again
+                    weights.pop()
+
+                StableDiffusionXLPipeline.save_lora_weights(
+                    output_dir,
+                    unet_lora_layers=unet_lora_layers_to_save,
+                    text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
+                    text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
+                )
+
+            def load_model_hook(models, input_dir):
+                unet_ = None
+                text_encoder_one_ = None
+                text_encoder_two_ = None
+
+                while len(models) > 0:
+                    model = models.pop()
+
+                    if isinstance(model, type(accelerator.unwrap_model(unet))):
+                        unet_ = model
+                    elif isinstance(model, type(accelerator.unwrap_model(text_encoder_one))):
+                        text_encoder_one_ = model
+                    elif isinstance(model, type(accelerator.unwrap_model(text_encoder_two))):
+                        text_encoder_two_ = model
+                    else:
+                        raise ValueError(f"unexpected save model: {model.__class__}")
+
+                lora_state_dict, network_alphas = LoraLoaderMixin.lora_state_dict(input_dir)
+                LoraLoaderMixin.load_lora_into_unet(lora_state_dict, network_alphas=network_alphas, unet=unet_)
+
+                text_encoder_state_dict = {k: v for k, v in lora_state_dict.items() if "text_encoder." in k}
+                LoraLoaderMixin.load_lora_into_text_encoder(
+                    text_encoder_state_dict, network_alphas=network_alphas, text_encoder=text_encoder_one_
+                )
+
+                text_encoder_2_state_dict = {k: v for k, v in lora_state_dict.items() if "text_encoder_2." in k}
+                LoraLoaderMixin.load_lora_into_text_encoder(
+                    text_encoder_2_state_dict, network_alphas=network_alphas, text_encoder=text_encoder_two_
+                )
+        else:
+            # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+            def save_model_hook(
+                models: list[UNet2DConditionModel],
+                weights: list[torch.Tensor],
+                output_dir: str,
+            ):
+                if self.use_ema:
+                    ema_unet.save_pretrained(os.path.join(output_dir, "unet_ema"))
+
+                for model in models:
+                    model.save_pretrained(os.path.join(output_dir, "unet"))
+
+                    # make sure to pop weight so that corresponding model is not saved again
+                    weights.pop()
+
+            def load_model_hook(models: list[UNet2DConditionModel], input_dir: str):
+                if self.use_ema:
+                    loaded_model = EMAModel.from_pretrained(
+                        os.path.join(input_dir, "unet_ema"), UNet2DConditionModel
+                    )
+                    ema_unet.load_state_dict(loaded_model.state_dict())
+                    ema_unet.to(accelerator.device)
+                    del loaded_model
+
+                for _ in range(len(models)):
+                    # pop models so that they are not loaded again
+                    model = models.pop()
+
+                    loaded_model = UNet2DConditionModel.from_pretrained(input_dir, subfolder="unet")
+                    model.register_to_config(**loaded_model.config)
+
+                    model.load_state_dict(loaded_model.state_dict())
+                    model.to(accelerator.device)
+                    del loaded_model
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
         if self.gradient_checkpointing:
+            assert not self.use_lora, "Gradient checkpointing is not supported with LoRA"
+
             unet.enable_gradient_checkpointing()
 
         if self.allow_tf32:
@@ -444,14 +568,34 @@ class SDXLTrainer(BaseTrainer):
         else:
             overrode_max_train_steps = False
 
+        if optimizer_config.auto_scale_lr:
+            optimizer_config.learning_rate = (
+                optimizer_config.learning_rate * self.gradient_accumulation_steps * self.train_batch_size * accelerator.num_processes
+            )
+
+        if self.use_lora:
+            params_to_optimize = unet_lora_parameters
+
+            if self.train_text_encoder:
+                params_to_optimize = itertools.chain(
+                    params_to_optimize, text_lora_parameters_one, text_lora_parameters_two
+                )
+        else:
+            params_to_optimize = unet.parameters()
+
         optimizer, lr_scheduler = self.setup_optimizer(
-            unet.parameters(),
+            params_to_optimize,
             optimizer_config=optimizer_config,
         )
 
-        train_dataloader, unet, optimizer, lr_scheduler = accelerator.prepare(
-            train_dataloader, unet, optimizer, lr_scheduler
-        )
+        if self.train_text_encoder:
+            train_dataloader, unet, text_encoder_one, text_encoder_two, optimizer, lr_scheduler = accelerator.prepare(
+                train_dataloader, unet, text_encoder_one, text_encoder_two, optimizer, lr_scheduler
+            )
+        else:
+            train_dataloader, unet, optimizer, lr_scheduler = accelerator.prepare(
+                train_dataloader, unet, optimizer, lr_scheduler
+            )
 
         # We need to recalculate our total training steps as the size of the training dataloader may have changed.
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / self.gradient_accumulation_steps)
@@ -462,7 +606,12 @@ class SDXLTrainer(BaseTrainer):
         if accelerator.is_main_process:
             accelerator.init_trackers(
                 self.project_name,
-                config=(),  # TODO: add config
+                config={
+                    "data": data_config,
+                    "model": model_config,
+                    "optimizer": optimizer_config,
+                    "trainer": self.config,
+                },
             )
 
         total_batch_size = self.train_batch_size * accelerator.num_processes * self.gradient_accumulation_steps
@@ -495,8 +644,8 @@ class SDXLTrainer(BaseTrainer):
                 )
                 self.resume_from_checkpoint = None
             else:
-                logger.info(f"Loading model from {self.resume_from_checkpoint}")
-                accelerator.load_state(os.path.join(self.resume_from_checkpoint, dir_name))
+                logger.info(f"Loading model from {dir_name}")
+                accelerator.load_state(os.path.join(self.output_dir, dir_name))
                 global_step = int(dir_name.split("-")[1])
 
                 resume_global_step = global_step * self.gradient_accumulation_steps
@@ -511,19 +660,29 @@ class SDXLTrainer(BaseTrainer):
 
         for epoch in range(first_epoch, self.max_epochs):
             unet.train()
+            if self.train_text_encoder:
+                text_encoder_one.train()
+                text_encoder_two.train()
+
             train_loss = 0.0
 
             for step, batch in enumerate(train_dataloader):
-                if self.resume_from_checkpoint is not None and step < resume_step:
+                if self.resume_from_checkpoint is not None and epoch == first_epoch and step < resume_step:
                     if step % self.gradient_accumulation_steps == 0:
                         progress_bar.update(1)
                     continue
+
+                prompt_embeds, pooled_prompt_embeds = encode_prompts(
+                    batch,
+                    text_encoder_one=text_encoder_one,
+                    text_encoder_two=text_encoder_two,
+                )
 
                 model_input = compute_vae_encodings(batch, vae)
                 noise = torch.randn_like(model_input)
                 if self.noise_offset:
                     # https://www.crosslabs.org//blog/diffusion-with-offset-noise
-                    noise += self.noise_offset * torch.randn_like(
+                    noise += self.noise_offset * torch.randn(
                         (model_input.shape[0], model_input.shape[1], 1, 1),
                         device=model_input.device,
                     )
@@ -556,10 +715,7 @@ class SDXLTrainer(BaseTrainer):
 
                     # Predict the noise residual
                     unet_added_conditions = {"time_ids": add_time_ids}
-                    prompt_embeds = batch["prompt_embeds"].to(accelerator.device)
-                    pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(accelerator.device)
                     unet_added_conditions.update({"text_embeds": pooled_prompt_embeds})
-                    prompt_embeds = prompt_embeds
 
                     model_pred = unet(
                         noisy_model_input,
@@ -604,6 +760,17 @@ class SDXLTrainer(BaseTrainer):
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
                         params_to_clip = unet.parameters()
+
+                        if self.use_lora:
+                            params_to_clip = unet_lora_parameters
+
+                            if self.train_text_encoder:
+                                params_to_clip = itertools.chain(
+                                    params_to_clip, text_lora_parameters_one, text_lora_parameters_two
+                                )
+                        else:
+                            params_to_clip = unet.parameters()
+
                         accelerator.clip_grad_norm_(params_to_clip, self.max_grad_norm)
 
                     optimizer.step()
@@ -650,6 +817,7 @@ class SDXLTrainer(BaseTrainer):
                     break
 
             if accelerator.is_main_process:
+                # TODO: validation_every_n_steps
                 if self.validation_prompt is not None and epoch % self.validation_every_n_steps == 0:
                     logger.info(
                         f"Running validation... \n Generating {self.num_validation_samples} images with prompt:"
@@ -661,14 +829,16 @@ class SDXLTrainer(BaseTrainer):
                         ema_unet.copy_to(unet.parameters())
 
                     # create pipeline
-                    vae = AutoencoderKL.from_pretrained(
-                        model_config.model_name_or_path,
-                        revision=model_config.revision,
-                        subfolder="vae",
-                    )
+                    # vae = AutoencoderKL.from_pretrained(
+                    #     model_config.model_name_or_path,
+                    #     revision=model_config.revision,
+                    #     subfolder="vae",
+                    # )
                     pipeline = StableDiffusionXLPipeline.from_pretrained(
                         model_config.model_name_or_path,
                         vae=vae,
+                        text_encoder=accelerator.unwrap_model(text_encoder_one),
+                        text_encoder_2=accelerator.unwrap_model(text_encoder_two),
                         unet=accelerator.unwrap_model(unet),
                         revision=model_config.revision,
                         torch_dtype=weight_dtype,
@@ -689,7 +859,7 @@ class SDXLTrainer(BaseTrainer):
 
                     with torch.cuda.amp.autocast():
                         images = [
-                            pipeline(**pipeline_args, generator=generator, num_inference_steps=25).images[0]
+                            pipeline(**pipeline_args, generator=generator).images[0]
                             for _ in range(self.num_validation_samples)
                         ]
 
@@ -718,24 +888,60 @@ class SDXLTrainer(BaseTrainer):
             if self.use_ema:
                 ema_unet.copy_to(unet.parameters())
 
-            # Serialize pipeline.
-            vae = AutoencoderKL.from_pretrained(
-                model_config.model_name_or_path,
-                revision=model_config.revision,
-                subfolder="vae",
-                torch_dtype=weight_dtype,
-            )
-            pipeline = StableDiffusionXLPipeline.from_pretrained(
-                model_config.model_name_or_path,
-                unet=unet,
-                vae=vae,
-                revision=model_config.revision,
-                torch_dtype=weight_dtype,
-            )
-            if self.prediction_type is not None:
-                scheduler_args = {"prediction_type": self.prediction_type}
-                pipeline.scheduler = pipeline.scheduler.from_config(pipeline.scheduler.config, **scheduler_args)
-            pipeline.save_pretrained(self.output_dir)
+            if self.train_text_encoder:
+                text_encoder_one = accelerator.unwrap_model(text_encoder_one)
+                text_encoder_lora_layers = text_encoder_lora_state_dict(text_encoder_one)
+                text_encoder_two = accelerator.unwrap_model(text_encoder_two)
+                text_encoder_2_lora_layers = text_encoder_lora_state_dict(text_encoder_two)
+            else:
+                text_encoder_lora_layers = None
+                text_encoder_2_lora_layers = None
+
+            if self.use_lora:
+                unet_lora_layers = unet_attn_processors_state_dict(unet)
+
+                StableDiffusionXLPipeline.save_lora_weights(
+                    save_directory=self.output_dir,
+                    unet_lora_layers=unet_lora_layers,
+                    text_encoder_lora_layers=text_encoder_lora_layers,
+                    text_encoder_2_lora_layers=text_encoder_2_lora_layers,
+                )
+
+                del unet
+                del text_encoder_one
+                del text_encoder_two
+                del text_encoder_lora_layers
+                del text_encoder_2_lora_layers
+                torch.cuda.empty_cache()
+
+                # Final inference
+                # Load previous pipeline
+                pipeline = StableDiffusionXLPipeline.from_pretrained(
+                    model_config.model_name_or_path, vae=vae, revision=model_config.revision, torch_dtype=weight_dtype
+                )
+                pipeline = pipeline.to(accelerator.device)
+
+                # load attention processors
+                pipeline.load_lora_weights(self.output_dir)
+            else:
+                # Serialize pipeline.
+                vae = AutoencoderKL.from_pretrained(
+                    model_config.model_name_or_path,
+                    revision=model_config.revision,
+                    subfolder="vae",
+                    torch_dtype=weight_dtype,
+                )
+                pipeline = StableDiffusionXLPipeline.from_pretrained(
+                    model_config.model_name_or_path,
+                    unet=unet,
+                    vae=vae,
+                    revision=model_config.revision,
+                    torch_dtype=weight_dtype,
+                )
+                if self.prediction_type is not None:
+                    scheduler_args = {"prediction_type": self.prediction_type}
+                    pipeline.scheduler = pipeline.scheduler.from_config(pipeline.scheduler.config, **scheduler_args)
+                pipeline.save_pretrained(self.output_dir)
 
             # run inference
             images = []
@@ -744,7 +950,7 @@ class SDXLTrainer(BaseTrainer):
                 generator = torch.Generator(device=accelerator.device).manual_seed(self.seed) if self.seed else None
                 with torch.cuda.amp.autocast():
                     images = [
-                        pipeline(self.validation_prompt, num_inference_steps=25, generator=generator).images[0]
+                        pipeline(self.validation_prompt, generator=generator).images[0]
                         for _ in range(self.num_validation_samples)
                     ]
 
@@ -766,11 +972,11 @@ class SDXLTrainer(BaseTrainer):
                 # save_model_card(
                 #     repo_id=repo_id,
                 #     images=images,
-                #     validation_prompt=args.validation_prompt,
-                #     base_model=args.pretrained_model_name_or_path,
-                #     dataset_name=args.dataset_name,
-                #     repo_folder=args.output_dir,
-                #     vae_path=args.pretrained_vae_model_name_or_path,
+                #     validation_prompt=self.validation_prompt,
+                #     base_model=model_config.model_name_or_path,
+                #     dataset_name=data_config.dataset_name,
+                #     repo_folder=self.output_dir,
+                #     vae_path=model_config.model_name_or_path,
                 # )
                 upload_folder(
                     repo_id=repo_id,

@@ -1,16 +1,31 @@
 data:
-  dataset_name: "./data/mj-52-512x512"
+  dataset_name: "./data/mj-52"
   image_column: "image"
   caption_column: "improved_prompt"
   random_flip: True
+  resolution: 1024
 
 model:
   model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
 
 optimizer:
+  learning_rate: 1e-4
   lr_scheduler: constant_with_warmup
 
 trainer:
   class_path: omni_diffusion.trainers.sdxl_trainer.SDXLTrainer
   init_args:
     project_name: "od-debug"
+    output_dir: ./outputs_1024_offset
+    max_epochs: 1
+    train_batch_size: 4
+    checkpointing_every_n_steps: 1000
+    validation_every_n_steps: 1
+    validation_prompt: "cute dragon creature"
+    mixed_precision: fp16
+    use_xformers: True
+    use_lora: True
+    lora_rank: 16
+    report_to: wandb
+    seed: 42
+    noise_offset: 0.05
