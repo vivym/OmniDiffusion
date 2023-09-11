@@ -7,7 +7,7 @@ class DataConfig:
 
     image_column: str = "image"
 
-    caption_column: str = "text"
+    prompt_column: str | list[str] = "prompt"
 
     num_workers: int = 0
 

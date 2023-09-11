@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from datasets import load_dataset
+from datasets import load_dataset, IterableDataset
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
@@ -196,6 +196,160 @@ class SDXLTrainer(BaseTrainer):
             revision=model_config.revision,
             subfolder="tokenizer_2",
             use_fast=True,
+        )
+
+        train_dataset: IterableDataset = load_dataset(
+            data_config.dataset_name,
+            split="train",
+            streaming=True,
+        )
+
+        column_names = train_dataset.column_names
+
+        if data_config.image_column not in column_names:
+            raise ValueError(
+                f"Image column name `{data_config.image_column}` should be one of {', '.join(column_names)}."
+            )
+
+        if isinstance(data_config.prompt_column, str):
+            data_config.prompt_column = [data_config.prompt_column]
+        assert len(data_config.prompt_column) > 0, "Prompt column must be specified."
+
+        for prompt_column in data_config.prompt_column:
+            if prompt_column not in column_names:
+                raise ValueError(
+                    f"Prompt column name `{prompt_column}` should be one of {', '.join(column_names)}."
+                )
+
+        train_resize = T.Resize(data_config.resolution, interpolation=T.InterpolationMode.BILINEAR)
+        train_crop = T.CenterCrop(data_config.resolution) if data_config.center_crop else T.RandomCrop(data_config.resolution)
+        train_flip = T.RandomHorizontalFlip(p=1.0)
+        train_normalize = T.Compose([
+            T.ToTensor(),
+            T.Normalize(
+                mean=[0.48145466, 0.4578275, 0.40821073],
+                std=[0.26862954, 0.26130258, 0.27577711],
+            ),
+        ])
+
+        def tokenize_prompts(samples: dict[str, list]) -> dict[str, list]:
+            prompts = []
+
+            num_samples = len(samples[data_config.prompt_column[0]])
+            for i in range(num_samples):
+                if random.random() < self.proportion_empty_prompts:
+                    prompts.append("")
+                else:
+                    prompts_i = []
+                    for prompt_column in data_config.prompt_column:
+                        prompt = samples[prompt_column][i]
+                        if isinstance(prompt, str):
+                            prompts_i.append(prompt)
+                        elif isinstance(prompt, (list, np.ndarray)):
+                            prompts_i.extend(list(prompt))
+                        else:
+                            raise ValueError(f"Unknown prompt type: {type(prompt)}")
+
+                    prompts.append(random.choice(prompts_i))
+
+            input_ids_one = tokenizer_one(
+                prompts,
+                padding="max_length",
+                truncation=True,
+                max_length=tokenizer_one.model_max_length,
+                return_tensors="pt",
+            ).input_ids
+
+            input_ids_two = tokenizer_two(
+                prompts,
+                padding="max_length",
+                truncation=True,
+                max_length=tokenizer_two.model_max_length,
+                return_tensors="pt",
+            ).input_ids
+
+            samples["input_ids_one"] = input_ids_one
+            samples["input_ids_two"] = input_ids_two
+
+            return samples
+
+        def preprocess_images(samples: dict[str, list]) -> dict[str, list]:
+            # import time
+            # start = time.time()
+            images = [
+                Image.open(io.BytesIO(image_data))
+                for image_data in samples[data_config.image_column]
+            ]
+
+            original_sizes = []
+            all_images = []
+            crop_top_lefts = []
+
+            for image in images:
+                original_sizes.append((image.height, image.width))
+                image = train_resize(image)
+
+                if data_config.center_crop:
+                    y1 = max(0, int(round(image.height - data_config.resolution) / 2.0))
+                    x1 = max(0, int(round(image.width - data_config.resolution) / 2.0))
+                    image = train_crop(image)
+                else:
+                    y1, x1, h, w = train_crop.get_params(image, (data_config.resolution, data_config.resolution))
+                    image = TrF.crop(image, y1, x1, h, w)
+
+                if data_config.random_flip and random.random() < 0.5:
+                    x1 = image.width - x1
+                    image = train_flip(image)
+
+                crop_top_lefts.append((y1, x1))
+                image = train_normalize(image)
+                all_images.append(image)
+
+            # return all_images, original_sizes, crop_top_lefts
+            # print("all_images", len(all_images), time.time() - start)
+            # print("original_sizes", original_sizes)
+
+            samples["pixel_values"] = all_images
+            samples["original_sizes"] = original_sizes
+            samples["crop_top_lefts"] = crop_top_lefts
+
+            return samples
+
+        with accelerator.main_process_first():
+            train_dataset = train_dataset.map(
+                tokenize_prompts,
+                batched=True,
+                batch_size=64,
+            )
+            train_dataset = train_dataset.map(
+                preprocess_images,
+                batched=True,
+                batch_size=64,
+            )
+            train_dataset = train_dataset.remove_columns(column_names)
+            train_dataset = train_dataset.shuffle(seed=self.seed, buffer_size=128)
+
+        def collate_fn(samples: dict[str, list]):
+            input_ids_one = torch.stack([sample["input_ids_one"] for sample in samples])
+            input_ids_two = torch.stack([sample["input_ids_two"] for sample in samples])
+            pixel_values = torch.stack([sample["pixel_values"] for sample in samples])
+            pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+            original_sizes = torch.as_tensor([sample["original_sizes"] for sample in samples])
+            crop_top_lefts = torch.as_tensor([sample["crop_top_lefts"] for sample in samples])
+
+            return {
+                "input_ids_one": input_ids_one,
+                "input_ids_two": input_ids_two,
+                "pixel_values": pixel_values,
+                "original_sizes": original_sizes,
+                "crop_top_lefts": crop_top_lefts,
+            }
+
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=self.train_batch_size,
+            num_workers=data_config.num_workers,
+            collate_fn=collate_fn,
         )
 
         # import text encoder classes
@@ -434,149 +588,12 @@ class SDXLTrainer(BaseTrainer):
         if self.allow_tf32:
             torch.backends.cuda.matmul.allow_tf32 = True
 
-        dataset_dict = load_dataset(
-            data_config.dataset_name,
-            # TODO: cache dir
-        )
-
-        column_names = dataset_dict["train"].column_names
-
-        if data_config.image_column not in column_names:
-            raise ValueError(
-                f"Image column name `{data_config.image_column}` should be one of {', '.join(column_names)}."
-            )
-
-        if data_config.caption_column not in column_names:
-            raise ValueError(
-                f"Caption column name `{data_config.image_column}` should be one of {', '.join(column_names)}."
-            )
-
-        train_resize = T.Resize(data_config.resolution, interpolation=T.InterpolationMode.BILINEAR)
-        train_crop = T.CenterCrop(data_config.resolution) if data_config.center_crop else T.RandomCrop(data_config.resolution)
-        train_flip = T.RandomHorizontalFlip(p=1.0)
-        train_normalize = T.Compose([
-            T.ToTensor(),
-            T.Normalize(
-                mean=[0.5],     # TODO: check if this is correct
-                std=[0.5],
-                # mean=[0.48145466, 0.4578275, 0.40821073],
-                # std=[0.26862954, 0.26130258, 0.27577711],
-            ),
-        ])
-
-        def tokenize_captions(
-            samples, proportion_empty_prompts: float = 0.0, is_train: bool = True
-        ) -> tuple[torch.Tensor, torch.Tensor]:
-            captions = []
-
-            for caption in samples[data_config.caption_column]:
-                if is_train and random.random() < proportion_empty_prompts:
-                    captions.append("")
-                elif isinstance(caption, str):
-                    captions.append(caption)
-                elif isinstance(caption, (list, np.ndarray)):
-                    captions.append(random.choice(caption) if is_train else caption[0])
-                else:
-                    raise ValueError(f"Unknown caption type: {type(caption)}")
-
-            input_ids_one = tokenizer_one(
-                captions,
-                padding="max_length",
-                truncation=True,
-                max_length=tokenizer_one.model_max_length,
-                return_tensors="pt",
-            ).input_ids
-
-            input_ids_two = tokenizer_two(
-                captions,
-                padding="max_length",
-                truncation=True,
-                max_length=tokenizer_two.model_max_length,
-                return_tensors="pt",
-            ).input_ids
-
-            return input_ids_one, input_ids_two
-
-        def preprocess_images(samples, is_train: bool = True) -> torch.Tensor:
-            images = [
-                Image.open(io.BytesIO(image_data))
-                for image_data in samples[data_config.image_column]
-            ]
-
-            original_sizes = []
-            all_images = []
-            crop_top_lefts = []
-
-            for image in images:
-                original_sizes.append((image.height, image.width))
-                image = train_resize(image)
-
-                if data_config.center_crop or is_train:
-                    y1 = max(0, int(round(image.height - data_config.resolution) / 2.0))
-                    x1 = max(0, int(round(image.width - data_config.resolution) / 2.0))
-                    image = train_crop(image)
-                else:
-                    y1, x1, h, w = train_crop.get_params(image, (data_config.resolution, data_config.resolution))
-                    image = TrF.crop(image, y1, x1, h, w)
-
-                if data_config.random_flip and is_train and random.random() < 0.5:
-                    x1 = image.width - x1
-                    image = train_flip(image)
-
-                crop_top_lefts.append((y1, x1))
-                image = train_normalize(image)
-                all_images.append(image)
-
-            return all_images, original_sizes, crop_top_lefts
-
-        def preprocess_train(samples):
-            input_ids_one, input_ids_two = tokenize_captions(
-                samples,
-                proportion_empty_prompts=self.proportion_empty_prompts,
-                is_train=True,
-            )
-            samples["input_ids_one"] = input_ids_one
-            samples["input_ids_two"] = input_ids_two
-
-            images, original_sizes, crop_top_lefts = preprocess_images(samples, is_train=True)
-            samples["pixel_values"] = images
-            samples["original_sizes"] = original_sizes
-            samples["crop_top_lefts"] = crop_top_lefts
-
-            return samples
-
-        with accelerator.main_process_first():
-            train_dataset = dataset_dict["train"].with_transform(preprocess_train)
-
-        def collate_fn(samples):
-            pixel_values = torch.stack([sample["pixel_values"] for sample in samples])
-            pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-            input_ids_one = torch.stack([sample["input_ids_one"] for sample in samples])
-            input_ids_two = torch.stack([sample["input_ids_two"] for sample in samples])
-            original_sizes = [sample["original_sizes"] for sample in samples]
-            crop_top_lefts = [sample["crop_top_lefts"] for sample in samples]
-            return {
-                "pixel_values": pixel_values,
-                "input_ids_one": input_ids_one,
-                "input_ids_two": input_ids_two,
-                "original_sizes": original_sizes,
-                "crop_top_lefts": crop_top_lefts,
-            }
-
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=self.train_batch_size,
-            num_workers=data_config.num_workers,
-            collate_fn=collate_fn,
-            shuffle=True,
-        )
-
-        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / self.gradient_accumulation_steps)
-        if self.max_steps is None:
-            self.max_steps = self.max_epochs * num_update_steps_per_epoch
-            overrode_max_train_steps = True
-        else:
-            overrode_max_train_steps = False
+        # num_update_steps_per_epoch = math.ceil(len(train_dataset) / self.gradient_accumulation_steps)
+        # if self.max_steps is None:
+        #     self.max_steps = self.max_epochs * num_update_steps_per_epoch
+        #     overrode_max_train_steps = True
+        # else:
+        #     overrode_max_train_steps = False
 
         if optimizer_config.auto_scale_lr:
             optimizer_config.learning_rate = (
@@ -608,10 +625,11 @@ class SDXLTrainer(BaseTrainer):
             )
 
         # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-        num_update_steps_per_epoch = math.ceil(len(train_dataloader) / self.gradient_accumulation_steps)
-        if overrode_max_train_steps:
-            self.max_steps = self.max_epochs * num_update_steps_per_epoch
-        self.max_epochs = math.ceil(self.max_steps / num_update_steps_per_epoch)
+        # num_update_steps_per_epoch = math.ceil(len(train_dataset) / self.gradient_accumulation_steps)
+        # if overrode_max_train_steps:
+        #     self.max_steps = self.max_epochs * num_update_steps_per_epoch
+        # self.max_epochs = math.ceil(self.max_steps / num_update_steps_per_epoch)
+        self.max_epochs = 100000000
 
         if accelerator.is_main_process:
             accelerator.init_trackers(
@@ -627,8 +645,8 @@ class SDXLTrainer(BaseTrainer):
         total_batch_size = self.train_batch_size * accelerator.num_processes * self.gradient_accumulation_steps
 
         logger.info("***** Running training *****")
-        logger.info(f"  Num examples = {len(train_dataset)}")
-        logger.info(f"  Num Epochs = {self.max_epochs}")
+        # logger.info(f"  Num examples = {len(train_dataset)}")
+        # logger.info(f"  Num Epochs = {self.max_epochs}")
         logger.info(f"  Instantaneous batch size per device = {self.train_batch_size}")
         logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
         logger.info(f"  Gradient Accumulation steps = {self.gradient_accumulation_steps}")
@@ -659,8 +677,13 @@ class SDXLTrainer(BaseTrainer):
                 global_step = int(dir_name.split("-")[1])
 
                 resume_global_step = global_step * self.gradient_accumulation_steps
-                first_epoch = global_step // num_update_steps_per_epoch
-                resume_step = resume_global_step % (num_update_steps_per_epoch * self.gradient_accumulation_steps)
+                # first_epoch = global_step // num_update_steps_per_epoch
+                # resume_step = resume_global_step % (num_update_steps_per_epoch * self.gradient_accumulation_steps)
+                first_epoch = 0
+                resume_step = 0
+
+        # if accelerator.is_main_process:
+        #     print("#1")
 
         progress_bar = tqdm(
             range(global_step, self.max_steps),
@@ -668,7 +691,18 @@ class SDXLTrainer(BaseTrainer):
             disable=not accelerator.is_local_main_process,
         )
 
+        # if accelerator.is_main_process:
+        #     print("#2")
+
         for epoch in range(first_epoch, self.max_epochs):
+            # if accelerator.is_main_process:
+            #     print("#3")
+
+            # train_dataset.set_epoch(epoch)
+
+            # if accelerator.is_main_process:
+            #     print("#4")
+
             unet.train()
             if self.train_text_encoder:
                 text_encoder_one.train()
@@ -682,13 +716,18 @@ class SDXLTrainer(BaseTrainer):
                         progress_bar.update(1)
                     continue
 
+                # if accelerator.is_main_process:
+                #     print("#5")
+
                 # time ids
                 def compute_time_ids(original_size, crops_coords_top_left):
                     # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
                     target_size = (data_config.resolution, data_config.resolution)
-                    add_time_ids = list(original_size + crops_coords_top_left + target_size)
-                    add_time_ids = torch.tensor([add_time_ids])
-                    add_time_ids = add_time_ids.to(accelerator.device, dtype=weight_dtype)
+                    # add_time_ids = list(original_size + crops_coords_top_left + target_size)
+                    # add_time_ids = torch.tensor([add_time_ids])
+                    target_size = torch.as_tensor(target_size, device=accelerator.device, dtype=weight_dtype)
+                    add_time_ids = torch.cat([original_size, crops_coords_top_left, target_size], dim=0)
+                    # add_time_ids = add_time_ids.to(accelerator.device, dtype=weight_dtype)
                     return add_time_ids
 
                 with accelerator.accumulate(unet):
@@ -813,7 +852,7 @@ class SDXLTrainer(BaseTrainer):
 
                                     logger.info(
                                         f"{len(checkpoints)} checkpoints already exist, "
-                                        "removing {len(removing_checkpoints)} checkpoints"
+                                        f"removing {len(removing_checkpoints)} checkpoints"
                                     )
                                     logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
 
@@ -877,7 +916,11 @@ class SDXLTrainer(BaseTrainer):
                 # Final inference
                 # Load previous pipeline
                 pipeline = StableDiffusionXLPipeline.from_pretrained(
-                    model_config.model_name_or_path, vae=vae, revision=model_config.revision, torch_dtype=weight_dtype
+                    model_config.model_name_or_path,
+                    revision=model_config.revision,
+                    vae=vae,
+                    safty_checker=None,
+                    torch_dtype=weight_dtype
                 )
                 pipeline = pipeline.to(accelerator.device)
 
@@ -887,9 +930,10 @@ class SDXLTrainer(BaseTrainer):
                 # Serialize pipeline.
                 pipeline = StableDiffusionXLPipeline.from_pretrained(
                     model_config.model_name_or_path,
+                    revision=model_config.revision,
                     unet=unet,
                     vae=vae,
-                    revision=model_config.revision,
+                    safty_checker=None,
                     torch_dtype=weight_dtype,
                 )
                 if self.prediction_type is not None:
@@ -947,11 +991,12 @@ class SDXLTrainer(BaseTrainer):
         # create pipeline
         pipeline = StableDiffusionXLPipeline.from_pretrained(
             model_config.model_name_or_path,
+            revision=model_config.revision,
             vae=vae,
             text_encoder=accelerator.unwrap_model(text_encoder_one),
             text_encoder_2=accelerator.unwrap_model(text_encoder_two),
             unet=accelerator.unwrap_model(unet),
-            revision=model_config.revision,
+            safety_checker=None,
             torch_dtype=weight_dtype,
         )
         if self.prediction_type is not None:

@@ -13,27 +13,27 @@ model:
   model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
 
 optimizer:
-  learning_rate: 5e-5
+  learning_rate: 0.0001
   auto_scale_lr: False
   weight_decay: 1e-2
-  # lr_scheduler: constant
-  lr_scheduler: constant_with_warmup
-  lr_warmup_steps: 500
+  lr_scheduler: constant
+  # lr_scheduler: constant_with_warmup
+  # lr_warmup_steps: 500
 
 trainer:
   class_path: omni_diffusion.trainers.sdxl_trainer.SDXLTrainer
   init_args:
     project_name: "openjourney-xl"
-    output_dir: ./outputs/openjourney-xl
+    output_dir: ./outputs/openjourney-xl3
     logging_dir: logs
     max_steps: 200000
     train_batch_size: 8
-    validation_every_n_steps: 500
+    validation_every_n_steps: 10000000
     validation_prompt: "cute dragon creature"
     num_validation_samples: 0
-    gradient_accumulation_steps: 8
+    gradient_accumulation_steps: 32
     gradient_checkpointing: False
-    checkpointing_every_n_steps: 500
+    checkpointing_every_n_steps: 100
     max_checkpoints: 20
     seed: 42
     use_ema: True

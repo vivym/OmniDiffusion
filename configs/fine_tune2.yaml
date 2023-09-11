@@ -16,15 +16,15 @@ optimizer:
   learning_rate: 5e-5
   auto_scale_lr: False
   weight_decay: 1e-2
-  # lr_scheduler: constant
-  lr_scheduler: constant_with_warmup
-  lr_warmup_steps: 500
+  lr_scheduler: constant
+  # lr_scheduler: constant_with_warmup
+  # lr_warmup_steps: 500
 
 trainer:
   class_path: omni_diffusion.trainers.sdxl_trainer.SDXLTrainer
   init_args:
     project_name: "openjourney-xl"
-    output_dir: ./outputs/openjourney-xl
+    output_dir: ./outputs/openjourney-xl2
     logging_dir: logs
     max_steps: 200000
     train_batch_size: 8
