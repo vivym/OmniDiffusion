@@ -27,13 +27,13 @@ trainer:
     output_dir: ./outputs/openjourney-xl3
     logging_dir: logs
     max_steps: 200000
-    train_batch_size: 8
+    train_batch_size: 4
     validation_every_n_steps: 10000000
     validation_prompt: "cute dragon creature"
     num_validation_samples: 0
-    gradient_accumulation_steps: 32
+    gradient_accumulation_steps: 64
     gradient_checkpointing: False
-    checkpointing_every_n_steps: 100
+    checkpointing_every_n_steps: 200
     max_checkpoints: 20
     seed: 42
     use_ema: True

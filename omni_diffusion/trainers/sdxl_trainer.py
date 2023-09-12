@@ -274,8 +274,6 @@ class SDXLTrainer(BaseTrainer):
             return samples
 
         def preprocess_images(samples: dict[str, list]) -> dict[str, list]:
-            # import time
-            # start = time.time()
             images = [
                 Image.open(io.BytesIO(image_data))
                 for image_data in samples[data_config.image_column]
@@ -304,10 +302,6 @@ class SDXLTrainer(BaseTrainer):
                 crop_top_lefts.append((y1, x1))
                 image = train_normalize(image)
                 all_images.append(image)
-
-            # return all_images, original_sizes, crop_top_lefts
-            # print("all_images", len(all_images), time.time() - start)
-            # print("original_sizes", original_sizes)
 
             samples["pixel_values"] = all_images
             samples["original_sizes"] = original_sizes
@@ -503,7 +497,8 @@ class SDXLTrainer(BaseTrainer):
                         raise ValueError(f"unexpected save model: {model.__class__}")
 
                     # make sure to pop weight so that corresponding model is not saved again
-                    weights.pop()
+                    if len(weights) > 0:
+                        weights.pop()
 
                 StableDiffusionXLPipeline.save_lora_weights(
                     output_dir,
@@ -555,7 +550,8 @@ class SDXLTrainer(BaseTrainer):
                     model.save_pretrained(os.path.join(output_dir, "unet"))
 
                     # make sure to pop weight so that corresponding model is not saved again
-                    weights.pop()
+                    if len(weights) > 0:
+                        weights.pop()
 
             def load_model_hook(models: list[UNet2DConditionModel], input_dir: str):
                 if self.use_ema:
@@ -600,6 +596,8 @@ class SDXLTrainer(BaseTrainer):
                 optimizer_config.learning_rate * self.gradient_accumulation_steps * self.train_batch_size * accelerator.num_processes
             )
 
+        unet = accelerator.prepare(unet)
+
         if self.use_lora:
             params_to_optimize = unet_lora_parameters
 
@@ -620,8 +618,8 @@ class SDXLTrainer(BaseTrainer):
                 train_dataloader, unet, text_encoder_one, text_encoder_two, optimizer, lr_scheduler
             )
         else:
-            train_dataloader, unet, optimizer, lr_scheduler = accelerator.prepare(
-                train_dataloader, unet, optimizer, lr_scheduler
+            train_dataloader, optimizer, lr_scheduler = accelerator.prepare(
+                train_dataloader, optimizer, lr_scheduler
             )
 
         # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -682,26 +680,14 @@ class SDXLTrainer(BaseTrainer):
                 first_epoch = 0
                 resume_step = 0
 
-        # if accelerator.is_main_process:
-        #     print("#1")
-
         progress_bar = tqdm(
             range(global_step, self.max_steps),
             desc="Steps",
             disable=not accelerator.is_local_main_process,
         )
 
-        # if accelerator.is_main_process:
-        #     print("#2")
-
         for epoch in range(first_epoch, self.max_epochs):
-            # if accelerator.is_main_process:
-            #     print("#3")
-
-            # train_dataset.set_epoch(epoch)
-
-            # if accelerator.is_main_process:
-            #     print("#4")
+            train_dataset.set_epoch(epoch)
 
             unet.train()
             if self.train_text_encoder:
@@ -715,9 +701,6 @@ class SDXLTrainer(BaseTrainer):
                     if step % self.gradient_accumulation_steps == 0:
                         progress_bar.update(1)
                     continue
-
-                # if accelerator.is_main_process:
-                #     print("#5")
 
                 # time ids
                 def compute_time_ids(original_size, crops_coords_top_left):
@@ -801,10 +784,19 @@ class SDXLTrainer(BaseTrainer):
                         loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                         loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                         loss = loss.mean()
+                        # if accelerator.is_main_process:
+                        print("loss", loss)
 
                     # Gather the losses across all processes for logging (if we use distributed training).
-                    avg_loss = accelerator.gather(loss.repeat(self.train_batch_size)).mean()
-                    train_loss += avg_loss.item() / self.gradient_accumulation_steps
+                    losses = accelerator.gather(loss.repeat(self.train_batch_size))
+                    if accelerator.is_main_process:
+                        print(losses)
+                    avg_loss = losses.mean()
+                    if accelerator.is_main_process:
+                        print("avg_loss", avg_loss)
+                    train_loss += avg_loss.item()
+                    if accelerator.is_main_process:
+                        print("train_loss", train_loss)
 
                     # Backpropagate
                     accelerator.backward(loss)
@@ -834,12 +826,12 @@ class SDXLTrainer(BaseTrainer):
                 if accelerator.sync_gradients:
                     progress_bar.update(1)
                     global_step += 1
+                    train_loss = train_loss / self.gradient_accumulation_steps
                     accelerator.log({"train_loss": train_loss}, step=global_step)
                     train_loss = 0.0
 
-                    if accelerator.is_main_process:
-                        if global_step % self.checkpointing_every_n_steps == 0:
-                            # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                    if global_step % self.checkpointing_every_n_steps == 0:
+                        if accelerator.is_main_process:
                             if self.max_checkpoints is not None:
                                 checkpoints = os.listdir(self.output_dir)
                                 checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
@@ -860,9 +852,38 @@ class SDXLTrainer(BaseTrainer):
                                         removing_checkpoint = os.path.join(self.output_dir, removing_checkpoint)
                                         shutil.rmtree(removing_checkpoint)
 
-                            save_path = os.path.join(self.output_dir, f"checkpoint-{global_step}")
-                            accelerator.save_state(save_path)
-                            logger.info(f"Saved state to {save_path}")
+                        accelerator.wait_for_everyone()
+
+                        save_path = os.path.join(self.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
+
+                    if accelerator.is_main_process:
+                        # if global_step % self.checkpointing_every_n_steps == 0:
+                        #     # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
+                        #     if self.max_checkpoints is not None:
+                        #         checkpoints = os.listdir(self.output_dir)
+                        #         checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                        #         checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+
+                        #         # before we save the new checkpoint, we need to have at _most_ `max_checkpoints - 1` checkpoints
+                        #         if len(checkpoints) >= self.max_checkpoints:
+                        #             num_to_remove = len(checkpoints) - self.max_checkpoints + 1
+                        #             removing_checkpoints = checkpoints[0:num_to_remove]
+
+                        #             logger.info(
+                        #                 f"{len(checkpoints)} checkpoints already exist, "
+                        #                 f"removing {len(removing_checkpoints)} checkpoints"
+                        #             )
+                        #             logger.info(f"removing checkpoints: {', '.join(removing_checkpoints)}")
+
+                        #             for removing_checkpoint in removing_checkpoints:
+                        #                 removing_checkpoint = os.path.join(self.output_dir, removing_checkpoint)
+                        #                 shutil.rmtree(removing_checkpoint)
+
+                        #     save_path = os.path.join(self.output_dir, f"checkpoint-{global_step}")
+                        #     accelerator.save_state(save_path)
+                        #     logger.info(f"Saved state to {save_path}")
 
                         if global_step % self.validation_every_n_steps == 0:
                             self._validation_step(
