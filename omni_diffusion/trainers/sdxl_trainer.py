@@ -596,7 +596,7 @@ class SDXLTrainer(BaseTrainer):
                 optimizer_config.learning_rate * self.gradient_accumulation_steps * self.train_batch_size * accelerator.num_processes
             )
 
-        unet = accelerator.prepare(unet)
+        # unet = accelerator.prepare(unet)
 
         if self.use_lora:
             params_to_optimize = unet_lora_parameters
@@ -618,8 +618,8 @@ class SDXLTrainer(BaseTrainer):
                 train_dataloader, unet, text_encoder_one, text_encoder_two, optimizer, lr_scheduler
             )
         else:
-            train_dataloader, optimizer, lr_scheduler = accelerator.prepare(
-                train_dataloader, optimizer, lr_scheduler
+            train_dataloader, unet, optimizer, lr_scheduler = accelerator.prepare(
+                train_dataloader, unet, optimizer, lr_scheduler
             )
 
         # We need to recalculate our total training steps as the size of the training dataloader may have changed.
@@ -785,18 +785,10 @@ class SDXLTrainer(BaseTrainer):
                         loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                         loss = loss.mean()
                         # if accelerator.is_main_process:
-                        print("loss", loss)
 
                     # Gather the losses across all processes for logging (if we use distributed training).
                     losses = accelerator.gather(loss.repeat(self.train_batch_size))
-                    if accelerator.is_main_process:
-                        print(losses)
-                    avg_loss = losses.mean()
-                    if accelerator.is_main_process:
-                        print("avg_loss", avg_loss)
-                    train_loss += avg_loss.item()
-                    if accelerator.is_main_process:
-                        print("train_loss", train_loss)
+                    train_loss += losses.mean().item()
 
                     # Backpropagate
                     accelerator.backward(loss)
