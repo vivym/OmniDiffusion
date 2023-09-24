@@ -1,16 +1,13 @@
-import math
 import os
-import io
 import itertools
-import random
 import shutil
-from pathlib import Path
 
 import numpy as np
+import ray.data
+import ray.train
 import torch
 from accelerate import Accelerator
 from accelerate.logging import get_logger
-from datasets import load_dataset, IterableDataset
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
@@ -21,22 +18,55 @@ from diffusers.loaders import LoraLoaderMixin, text_encoder_lora_state_dict
 from diffusers.models.attention_processor import LoRAAttnProcessor, LoRAAttnProcessor2_0
 from diffusers.training_utils import EMAModel
 from diffusers.utils.import_utils import is_xformers_available
-from huggingface_hub import create_repo, upload_folder
+from huggingface_hub import upload_folder
 from packaging import version
-from PIL import Image
 from torch.nn import functional as F
-from torch.utils.data import DataLoader
-from torchvision import transforms as T
-from torchvision.transforms import functional as TrF
 from tqdm import tqdm
 from transformers import AutoTokenizer, PretrainedConfig, PreTrainedModel
 
-from omni_diffusion.configs import (
-    DataConfig, ModelConfig, OptimizerConfig
-)
+from omni_diffusion.utils.multi_source_dataloader import MultiSourceDataLoader
 from .base_trainer import BaseTrainer
 
 logger = get_logger(__name__, log_level="INFO")
+
+
+def save_model_card(
+    repo_id: str,
+    images=None,
+    validation_prompt=None,
+    base_model=str,
+    dataset_name=str,
+    repo_folder=None,
+    vae_path=None,
+) -> None:
+    img_str = ""
+    for i, image in enumerate(images):
+        image.save(os.path.join(repo_folder, f"image_{i}.png"))
+        img_str += f"![img_{i}](./image_{i}.png)\n"
+
+    yaml = f"""
+---
+license: creativeml-openrail-m
+base_model: {base_model}
+dataset: {dataset_name}
+tags:
+- stable-diffusion-xl
+- stable-diffusion-xl-diffusers
+- text-to-image
+- diffusers
+inference: true
+---
+    """
+    model_card = f"""
+# Text-to-image finetuning - {repo_id}
+
+This pipeline was finetuned from **{base_model}** on the **{dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompt: {validation_prompt}: \n
+{img_str}
+
+Special VAE used for training: {vae_path}.
+"""
+    with open(os.path.join(repo_folder, "README.md"), "w") as f:
+        f.write(yaml + model_card)
 
 
 def import_model_class_from_model_name_or_path(
@@ -143,33 +173,86 @@ def compute_snr(
     return snr
 
 
-class SDXLTrainer(BaseTrainer):
-    def fit(
+class TokenizerActor:
+    def __init__(
         self,
-        data_config: DataConfig,
-        model_config: ModelConfig,
-        optimizer_config: OptimizerConfig,
+        model_name_or_path: str,
+        revision: str | None = None,
     ):
+        super().__init__()
+
+        self.tokenizer_one = AutoTokenizer.from_pretrained(
+            model_name_or_path,
+            revision=revision,
+            subfolder="tokenizer",
+            use_fast=True,
+        )
+        self.tokenizer_two = AutoTokenizer.from_pretrained(
+            model_name_or_path,
+            revision=revision,
+            subfolder="tokenizer_2",
+            use_fast=True,
+        )
+
+    def __call__(self, batch: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        prompts = list(batch["prompt"])
+
+        input_ids_one = self.tokenizer_one(
+            prompts,
+            padding="max_length",
+            truncation=True,
+            max_length=self.tokenizer_one.model_max_length,
+            return_tensors="np",
+        ).input_ids
+
+        input_ids_two = self.tokenizer_two(
+            prompts,
+            padding="max_length",
+            truncation=True,
+            max_length=self.tokenizer_two.model_max_length,
+            return_tensors="np",
+        ).input_ids
+
+        batch["input_ids_one"] = input_ids_one
+        batch["input_ids_two"] = input_ids_two
+
+        return batch
+
+
+class SDXLRayTrainer(BaseTrainer):
+    def apply_tokenizer(self, ds: ray.data.Dataset) -> ray.data.Dataset:
+        ds = ds.map_batches(
+            TokenizerActor,
+            fn_constructor_kwargs={
+                "model_name_or_path": self.model_name_or_path,
+                "revision": self.model_revision,
+            },
+            compute=ray.data.ActorPoolStrategy(size=self.num_dataset_workers),
+        )
+
+        return ds
+
+    def fit(self):
         accelerator = self.setup_accelerator()
 
-        if accelerator.is_main_process:
-            if self.output_dir is not None:
-                os.makedirs(self.output_dir, exist_ok=True)
-
-            if self.push_to_hub:
-                repo_id = create_repo(
-                    repo_id=self.hub_model_id or Path(self.output_dir).name,
-                    exist_ok=True,
-                ).repo_id
-
-        accelerator.wait_for_everyone()
+        train_dataloader = MultiSourceDataLoader(
+            batch_size=self.train_batch_size,
+            local_shuffle_buffer_size=256,
+            local_shuffle_seed=self.seed,
+            prefetch_batches=4,
+        )
+        for dataset_name in self.dataset_names:
+            meta = self.dataset_metas[dataset_name]
+            ds = ray.train.get_dataset_shard(dataset_name)
+            train_dataloader.add_dataset(ds, weight=meta["num_samples"])
 
         # Load scheduler and models.
         noise_scheduler: DDPMScheduler = DDPMScheduler.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.revision,
+            self.model_name_or_path,
+            revision=self.model_revision,
             subfolder="scheduler",
         )
+
         # Check for terminal SNR in combination with SNR Gamma
         if (
             self.snr_gamma is not None
@@ -179,211 +262,44 @@ class SDXLTrainer(BaseTrainer):
             )
         ):
             raise ValueError(
-                f"The selected noise scheduler for the model `{model_config.model_name_or_path}` uses rescaled betas for zero SNR.\n"
+                f"The selected noise scheduler for the model `{self.model_name_or_path}` uses rescaled betas for zero SNR.\n"
                 "When this configuration is present, the parameter `snr_gamma` may not be used without parameter `force_snr_gamma`.\n"
                 "This is due to a mathematical incompatibility between our current SNR gamma implementation, and a sigma value of zero."
             )
 
-        # Load the tokenizers.
-        tokenizer_one = AutoTokenizer.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.revision,
-            subfolder="tokenizer",
-            use_fast=True,
-        )
-        tokenizer_two = AutoTokenizer.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.revision,
-            subfolder="tokenizer_2",
-            use_fast=True,
-        )
-
-        train_dataset: IterableDataset = load_dataset(
-            data_config.dataset_name,
-            split="train",
-            streaming=True,
-        )
-
-        column_names = train_dataset.column_names
-
-        if data_config.image_column not in column_names:
-            raise ValueError(
-                f"Image column name `{data_config.image_column}` should be one of {', '.join(column_names)}."
-            )
-
-        if isinstance(data_config.prompt_column, str):
-            data_config.prompt_column = [data_config.prompt_column]
-        assert len(data_config.prompt_column) > 0, "Prompt column must be specified."
-
-        for prompt_column in data_config.prompt_column:
-            if prompt_column not in column_names:
-                raise ValueError(
-                    f"Prompt column name `{prompt_column}` should be one of {', '.join(column_names)}."
-                )
-
-        train_resize = T.Resize(data_config.resolution, interpolation=T.InterpolationMode.BILINEAR)
-        train_crop = T.CenterCrop(data_config.resolution) if data_config.center_crop else T.RandomCrop(data_config.resolution)
-        train_flip = T.RandomHorizontalFlip(p=1.0)
-        train_normalize = T.Compose([
-            T.ToTensor(),
-            T.Normalize(
-                mean=[0.48145466, 0.4578275, 0.40821073],
-                std=[0.26862954, 0.26130258, 0.27577711],
-            ),
-        ])
-
-        def tokenize_prompts(samples: dict[str, list]) -> dict[str, list]:
-            prompts = []
-
-            num_samples = len(samples[data_config.prompt_column[0]])
-            for i in range(num_samples):
-                if random.random() < self.proportion_empty_prompts:
-                    prompts.append("")
-                else:
-                    prompts_i = []
-                    for prompt_column in data_config.prompt_column:
-                        prompt = samples[prompt_column][i]
-                        if isinstance(prompt, str):
-                            prompts_i.append(prompt)
-                        elif isinstance(prompt, (list, np.ndarray)):
-                            prompts_i.extend(list(prompt))
-                        else:
-                            raise ValueError(f"Unknown prompt type: {type(prompt)}")
-
-                    prompts.append(random.choice(prompts_i))
-
-            input_ids_one = tokenizer_one(
-                prompts,
-                padding="max_length",
-                truncation=True,
-                max_length=tokenizer_one.model_max_length,
-                return_tensors="pt",
-            ).input_ids
-
-            input_ids_two = tokenizer_two(
-                prompts,
-                padding="max_length",
-                truncation=True,
-                max_length=tokenizer_two.model_max_length,
-                return_tensors="pt",
-            ).input_ids
-
-            samples["input_ids_one"] = input_ids_one
-            samples["input_ids_two"] = input_ids_two
-
-            return samples
-
-        def preprocess_images(samples: dict[str, list]) -> dict[str, list]:
-            images = [
-                Image.open(io.BytesIO(image_data))
-                for image_data in samples[data_config.image_column]
-            ]
-
-            original_sizes = []
-            all_images = []
-            crop_top_lefts = []
-            target_sizes = []
-
-            for image in images:
-                original_sizes.append((image.height, image.width))
-                target_sizes.append((data_config.resolution, data_config.resolution))
-                image = train_resize(image)
-
-                if data_config.center_crop:
-                    y1 = max(0, int(round(image.height - data_config.resolution) / 2.0))
-                    x1 = max(0, int(round(image.width - data_config.resolution) / 2.0))
-                    image = train_crop(image)
-                else:
-                    y1, x1, h, w = train_crop.get_params(image, (data_config.resolution, data_config.resolution))
-                    image = TrF.crop(image, y1, x1, h, w)
-
-                if data_config.random_flip and random.random() < 0.5:
-                    x1 = image.width - x1
-                    image = train_flip(image)
-
-                crop_top_lefts.append((y1, x1))
-                image = train_normalize(image)
-                all_images.append(image)
-
-            samples["pixel_values"] = all_images
-            samples["original_sizes"] = original_sizes
-            samples["crop_top_lefts"] = crop_top_lefts
-            samples["target_sizes"] = target_sizes
-
-            return samples
-
-        with accelerator.main_process_first():
-            train_dataset = train_dataset.map(
-                tokenize_prompts,
-                batched=True,
-                batch_size=64,
-            )
-            train_dataset = train_dataset.map(
-                preprocess_images,
-                batched=True,
-                batch_size=64,
-            )
-            train_dataset = train_dataset.remove_columns(column_names)
-            train_dataset = train_dataset.shuffle(seed=self.seed, buffer_size=128)
-
-        def collate_fn(samples: dict[str, list]):
-            input_ids_one = torch.stack([sample["input_ids_one"] for sample in samples])
-            input_ids_two = torch.stack([sample["input_ids_two"] for sample in samples])
-            pixel_values = torch.stack([sample["pixel_values"] for sample in samples])
-            pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-            original_sizes = torch.as_tensor([sample["original_sizes"] for sample in samples])
-            crop_top_lefts = torch.as_tensor([sample["crop_top_lefts"] for sample in samples])
-            target_sizes = torch.as_tensor([sample["target_sizes"] for sample in samples])
-
-            return {
-                "input_ids_one": input_ids_one,
-                "input_ids_two": input_ids_two,
-                "pixel_values": pixel_values,
-                "original_sizes": original_sizes,
-                "crop_top_lefts": crop_top_lefts,
-                "target_sizes": target_sizes,
-            }
-
-        train_dataloader = DataLoader(
-            train_dataset,
-            batch_size=self.train_batch_size,
-            num_workers=data_config.num_workers,
-            collate_fn=collate_fn,
-        )
-
         # import text encoder classes
         text_encode_cls_one = import_model_class_from_model_name_or_path(
-            model_config.model_name_or_path,
-            revision=model_config.revision,
+            self.model_name_or_path,
+            revision=self.model_revision,
             subfolder="text_encoder",
         )
 
         text_encode_cls_two = import_model_class_from_model_name_or_path(
-            model_config.model_name_or_path,
-            revision=model_config.revision,
+            self.model_name_or_path,
+            revision=self.model_revision,
             subfolder="text_encoder_2",
         )
 
         text_encoder_one = text_encode_cls_one.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.revision,
+            self.model_name_or_path,
+            revision=self.model_revision,
             subfolder="text_encoder",
         )
         text_encoder_two = text_encode_cls_two.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.revision,
+            self.model_name_or_path,
+            revision=self.model_revision,
             subfolder="text_encoder_2",
         )
 
         vae: AutoencoderKL = AutoencoderKL.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.revision,
+            self.model_name_or_path,
+            revision=self.model_revision,
             subfolder="vae",
         )
 
         unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.revision,
+            self.model_name_or_path,
+            revision=self.model_revision,
             subfolder="unet",
         )
 
@@ -420,8 +336,8 @@ class SDXLTrainer(BaseTrainer):
             assert not self.use_lora, "EMA is not supported with LoRA"
 
             ema_unet_base: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(
-                model_config.model_name_or_path,
-                revision=model_config.revision,
+                self.model_name_or_path,
+                revision=self.model_revision,
                 subfolder="unet",
             )
             ema_unet = EMAModel(
@@ -589,9 +505,9 @@ class SDXLTrainer(BaseTrainer):
         if self.allow_tf32:
             torch.backends.cuda.matmul.allow_tf32 = True
 
-        if optimizer_config.auto_scale_lr:
-            optimizer_config.learning_rate = (
-                optimizer_config.learning_rate * self.gradient_accumulation_steps * self.train_batch_size * accelerator.num_processes
+        if self.auto_scale_lr:
+            self.learning_rate = (
+                self.learning_rate * self.gradient_accumulation_steps * self.train_batch_size * accelerator.num_processes
             )
 
         if self.use_lora:
@@ -604,29 +520,21 @@ class SDXLTrainer(BaseTrainer):
         else:
             params_to_optimize = unet.parameters()
 
-        optimizer, lr_scheduler = self.setup_optimizer(
-            params_to_optimize,
-            optimizer_config=optimizer_config,
-        )
+        optimizer, lr_scheduler = self.setup_optimizer(params_to_optimize)
 
         if self.train_text_encoder:
-            train_dataloader, unet, text_encoder_one, text_encoder_two, optimizer, lr_scheduler = accelerator.prepare(
-                train_dataloader, unet, text_encoder_one, text_encoder_two, optimizer, lr_scheduler
+            unet, text_encoder_one, text_encoder_two, optimizer, lr_scheduler = accelerator.prepare(
+                unet, text_encoder_one, text_encoder_two, optimizer, lr_scheduler
             )
         else:
-            train_dataloader, unet, optimizer, lr_scheduler = accelerator.prepare(
-                train_dataloader, unet, optimizer, lr_scheduler
+            unet, optimizer, lr_scheduler = accelerator.prepare(
+                unet, optimizer, lr_scheduler
             )
 
         if accelerator.is_main_process:
             accelerator.init_trackers(
                 self.project_name,
-                config={
-                    "data": data_config,
-                    "model": model_config,
-                    "optimizer": optimizer_config,
-                    "trainer": self.config,
-                },
+                config=self.configs,
             )
 
         total_batch_size = self.train_batch_size * accelerator.num_processes * self.gradient_accumulation_steps
@@ -670,8 +578,6 @@ class SDXLTrainer(BaseTrainer):
         )
 
         for epoch in range(10000000):
-            train_dataset.set_epoch(epoch)
-
             unet.train()
             if self.train_text_encoder:
                 text_encoder_one.train()
@@ -827,7 +733,8 @@ class SDXLTrainer(BaseTrainer):
                             self._validation_step(
                                 global_step,
                                 accelerator=accelerator,
-                                model_config=model_config,
+                                model_name_or_path=self.model_name_or_path,
+                                model_revision=self.model_revision,
                                 text_encoder_one=text_encoder_one,
                                 text_encoder_two=text_encoder_two,
                                 vae=vae,
@@ -875,8 +782,8 @@ class SDXLTrainer(BaseTrainer):
                 # Final inference
                 # Load previous pipeline
                 pipeline = StableDiffusionXLPipeline.from_pretrained(
-                    model_config.model_name_or_path,
-                    revision=model_config.revision,
+                    self.model_name_or_path,
+                    revision=self.model_revision,
                     vae=vae,
                     safty_checker=None,
                     torch_dtype=weight_dtype
@@ -888,8 +795,8 @@ class SDXLTrainer(BaseTrainer):
             else:
                 # Serialize pipeline.
                 pipeline = StableDiffusionXLPipeline.from_pretrained(
-                    model_config.model_name_or_path,
-                    revision=model_config.revision,
+                    self.model_name_or_path,
+                    revision=self.model_revision,
                     unet=unet,
                     vae=vae,
                     safty_checker=None,
@@ -905,17 +812,17 @@ class SDXLTrainer(BaseTrainer):
             images = self._inference_step(global_step, accelerator, pipeline, stage="test")
 
             if self.push_to_hub:
-                # save_model_card(
-                #     repo_id=repo_id,
-                #     images=images,
-                #     validation_prompt=self.validation_prompt,
-                #     base_model=model_config.model_name_or_path,
-                #     dataset_name=data_config.dataset_name,
-                #     repo_folder=self.output_dir,
-                #     vae_path=model_config.model_name_or_path,
-                # )
+                save_model_card(
+                    repo_id=self.repo_id,
+                    images=images,
+                    validation_prompt=self.validation_prompt,
+                    base_model=self.model_name_or_path,
+                    dataset_name=self.dataset_name_or_path,
+                    repo_folder=self.output_dir,
+                    vae_path=self.model_name_or_path,
+                )
                 upload_folder(
-                    repo_id=repo_id,
+                    repo_id=self.repo_id,
                     folder_path=self.output_dir,
                     commit_message="End of training",
                     ignore_patterns=["step_*", "epoch_*"],
@@ -927,7 +834,8 @@ class SDXLTrainer(BaseTrainer):
         self,
         current_step: int,
         accelerator: Accelerator,
-        model_config: ModelConfig,
+        model_name_or_path: str,
+        model_revision: str | None,
         text_encoder_one: PreTrainedModel,
         text_encoder_two: PreTrainedModel,
         vae: AutoencoderKL,
@@ -949,8 +857,8 @@ class SDXLTrainer(BaseTrainer):
 
         # create pipeline
         pipeline = StableDiffusionXLPipeline.from_pretrained(
-            model_config.model_name_or_path,
-            revision=model_config.revision,
+            model_name_or_path,
+            revision=model_revision,
             vae=vae,
             text_encoder=accelerator.unwrap_model(text_encoder_one),
             text_encoder_2=accelerator.unwrap_model(text_encoder_two),

@@ -1,7 +1,13 @@
+import os
 import importlib
+from functools import partial
 from typing import Any, TYPE_CHECKING
 
+import ray
+
 from jsonargparse import ArgumentParser, ActionConfigFile
+from ray.train import CheckpointConfig, RunConfig, ScalingConfig, DataConfig as RayDataConfig
+from ray.train.torch import TorchTrainer
 
 from .configs import (
     DataConfig, ModelConfig, OptimizerConfig, LoggingConfig, HubConfig
@@ -78,22 +84,74 @@ class OmniCLI:
             subcommands=subcommands,
         )
 
-        self.config = self.parser.parse_args(args)
+        config = self.parser.parse_args(args)
 
         # Instantiate
-        self.config_instantiated = self.parser.instantiate_classes(self.config)
+        subcommand = config["subcommand"]
+        self.config = self.parser.instantiate_classes(config[subcommand])
 
-        subcommand = self.config["subcommand"]
+        trainer: BaseTrainer = self.config["trainer"]
 
-        self.trainer = self.config_instantiated[subcommand]["trainer"]
+        os.environ["RAY_AIR_LOCAL_CACHE_DIR"] = trainer.output_dir
 
-        config = self.config_instantiated[subcommand]
-        # Run subcomman
-        getattr(self.trainer, subcommand)(
-            data_config=config["data"],
-            model_config=config["model"],
-            optimizer_config=config["optimizer"],
+        ray.init(
+            runtime_env={
+                "env_vars": {
+                    "RAY_AIR_LOCAL_CACHE_DIR": os.environ["RAY_AIR_LOCAL_CACHE_DIR"],
+                },
+                "working_dir": ".",
+            },
         )
+
+        trainer.prepare_configs(
+            data_config=self.config["data"],
+            model_config=self.config["model"],
+            optimizer_config=self.config["optimizer"],
+            logging_config=self.config["logging"],
+            hub_config=self.config["hub"],
+        )
+
+        datasets = trainer.prepare_data()
+        dataset_names = list(datasets.keys())
+
+        os.makedirs(trainer.output_dir, exist_ok=True)
+        artifact_dir = os.path.join(trainer.output_dir, "artifact")
+        os.makedirs(artifact_dir, exist_ok=True)
+
+        if trainer.push_to_hub:
+            from huggingface_hub import create_repo
+
+            trainer.repo_id = create_repo(
+                repo_id=trainer.hub_model_id or os.path.basename(trainer.output_dir),
+                private=trainer.private_hub,
+                exist_ok=True,
+            ).repo_id
+
+        # Run subcomman
+        train_loop_per_worker = partial(
+            getattr(trainer, subcommand),
+            dataset_names=dataset_names,
+        )
+
+        trainer = TorchTrainer(
+            train_loop_per_worker,
+            run_config=RunConfig(
+                name=trainer.project_name,
+                storage_path=artifact_dir,
+                checkpoint_config=CheckpointConfig(
+                    num_to_keep=trainer.max_checkpoints,
+                ),
+                log_to_file=True,
+            ),
+            scaling_config=ScalingConfig(
+                num_workers=trainer.num_devices,
+                use_gpu=True,
+                resources_per_worker={"GPU": 1},
+            ),
+            datasets=datasets,
+            dataset_config=RayDataConfig(datasets_to_split=dataset_names),
+        )
+        trainer.fit()
 
     def add_subcommand(
         self,
@@ -128,11 +186,6 @@ class OmniCLI:
             OptimizerConfig,
             nested_key="optimizer",
         )
-
-        # parser.add_dataclass_arguments(
-        #     TrainerConfig,
-        #     nested_key="trainer",
-        # )
 
         parser.add_subclass_arguments(
             BaseTrainer,

@@ -22,7 +22,7 @@ trainer:
   class_path: omni_diffusion.trainers.sdxl_trainer.SDXLTrainer
   init_args:
     project_name: "openjourney-xl"
-    output_dir: ./outputs/openjourney-xl
+    output_dir: ./outputs/openjourney-xl2
     logging_dir: logs
     max_steps: 200000
     train_batch_size: 8
@@ -34,10 +34,10 @@ trainer:
     checkpointing_every_n_steps: 1000
     max_checkpoints: 20
     seed: 42
-    use_ema: True
+    use_ema: False
     mixed_precision: fp16
     use_xformers: True
     noise_offset: 0.05
     proportion_empty_prompts: 0.1
     report_to: wandb
-    # resume_from_checkpoint: latest
+    resume_from_checkpoint: latest

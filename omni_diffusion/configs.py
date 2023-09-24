@@ -3,19 +3,26 @@ from dataclasses import dataclass
 
 @dataclass
 class DataConfig:
-    dataset_name: str
+    dataset_name_or_path: str | list[str]
+
+    revision: str | None = None
 
     image_column: str = "image"
 
     prompt_column: str | list[str] = "prompt"
 
-    num_workers: int = 0
+    num_workers: int = 16
 
-    resolution: int = 512
+    resolution: int | tuple[int, int] | None = 512
 
     center_crop: bool = False
 
     random_flip: bool = False
+
+    # Proportion of image prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).
+    proportion_empty_prompts: float = 0.0
+
+    multi_aspect_training: bool = False
 
 
 @dataclass
@@ -43,7 +50,7 @@ class OptimizerConfig:
     # Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"]
     lr_scheduler: str | None = None
 
-    lr_warmup_steps: int = 500
+    lr_warmup_steps: int = 0
 
 
 @dataclass
@@ -108,10 +115,14 @@ class TrainerConfig:
 
     report_to: str = "tensorboard"
 
+    use_deepspeed: bool = False
+
 
 @dataclass
 class LoggingConfig:
     logging_dir: str = "logs"
+
+    report_to: str = "tensorboard"
 
 
 @dataclass
