@@ -47,7 +47,7 @@ class BaseTrainer(abc.ABC):
         project_name: str = "omni-diffusion",
         output_dir: str = "./outputs",
         num_devices: int = 1,
-        max_steps: int | None = None,
+        max_steps: int = 10000,
         train_batch_size: int = 16,
         validation_every_n_steps: int = 200,
         validation_prompt: str | None = None,
@@ -82,7 +82,7 @@ class BaseTrainer(abc.ABC):
         use_deepspeed: bool = False,
     ) -> None:
         self.project_name = project_name
-        self.output_dir = output_dir
+        self.output_dir = os.path.realpath(output_dir)
         self.num_devices = num_devices
         self.max_steps = max_steps
         self.train_batch_size = train_batch_size
@@ -284,26 +284,28 @@ class BaseTrainer(abc.ABC):
         datasets = {}
         dataset_metas = {}
         for sub_path in sub_paths:
+            match = re.match("^([0-9]+)_([0-9]+)_([0-9]+)$", sub_path.stem)
+            if match:
+                num_samples = int(match.group(3))
+                target_size = (int(match.group(1)), int(match.group(2)))
+
+                # TODO: fix me
+                if num_samples < 2048 * 1000:
+                    continue
+            else:
+                num_samples = 1
+                target_size = None
+
             if self.resolution is not None:
                 if isinstance(self.resolution, int):
                     target_size = (self.resolution, self.resolution)
                 else:
                     target_size = self.resolution
-            else:
-                match = re.match("^([0-9]+)_([0-9]+)_([0-9]+)$", sub_path.stem)
-                if match:
-                    num_samples = int(match.group(3))
-                    target_size = (int(match.group(1)), int(match.group(2)))
-
-                    if num_samples < 2048:
-                        continue
-                else:
-                    num_samples = 1
-                    target_size = None
 
             ds = ray.data.read_parquet(sub_path, columns=columns)
 
-            ds = ds.randomize_block_order(seed=self.seed)
+            # TODO: randomize block order
+            # ds = ds.randomize_block_order(seed=self.seed)
 
             ds = ds.map(partial(
                 select_prompt,
@@ -314,6 +316,8 @@ class BaseTrainer(abc.ABC):
             ds = ds.drop_columns([p for p in self.prompt_columns if p != "prompt"])
 
             ds = self.apply_tokenizer(ds)
+
+            ds = ds.drop_columns(["prompt"])
 
             ds = ds.map(partial(
                 process_image,
@@ -375,6 +379,7 @@ class BaseTrainer(abc.ABC):
                 offload_optimizer_device="none",
                 offload_param_device="none",
             )
+            deepspeed_plugin.hf_ds_config.config["train_micro_batch_size_per_gpu"] = self.train_batch_size
         else:
             deepspeed_plugin = None
 
@@ -505,11 +510,7 @@ def process_image(
         image = TrF.hflip(image)
 
     image: torch.Tensor = TrF.to_tensor(image)
-    image = TrF.normalize(
-        image,
-        mean=[0.48145466, 0.4578275, 0.40821073],
-        std=[0.26862954, 0.26130258, 0.27577711],
-    )
+    image = TrF.normalize(image, mean=[0.5], std=[0.5])
 
     row["image"] = image.numpy()
     row["original_size"] = np.array(original_size, dtype=np.int64)

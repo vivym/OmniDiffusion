@@ -9,11 +9,11 @@ class MultiSourceIterator:
         self.source_iters = [s[0] for s in sources]
 
         weights = np.array([s[1] for s in sources])
-        self.probs =  weights / weights.sum()
+        self.probs: np.ndarray =  weights / weights.sum()
 
         self.indices = np.arange(len(sources))
 
-        self.remaining_iters = len(self.sources)
+        self.remaining_iters = len(sources)
 
     def __next__(self) -> Any:
         data = None
@@ -21,11 +21,12 @@ class MultiSourceIterator:
             try:
                 idx = np.random.choice(self.indices, p=self.probs)
                 data = next(self.source_iters[idx])
+                break
             except StopIteration:
                 self.remaining_iters -= 1
                 self.probs[idx] = 0.0
                 if self.remaining_iters > 0:
-                    self.probs = self.probs / self.probs[idx].sum()
+                    self.probs = self.probs / self.probs.sum()
 
         if data is None:
             raise StopIteration
@@ -56,7 +57,7 @@ class MultiSourceDataLoader:
     def __iter__(self) -> MultiSourceIterator:
         return MultiSourceIterator([
             (
-                ds.iter_torch_batches(
+                iter(ds.iter_torch_batches(
                     batch_size=self.batch_size,
                     drop_last=True,
                     local_shuffle_buffer_size=self.local_shuffle_buffer_size,
@@ -64,7 +65,7 @@ class MultiSourceDataLoader:
                         self.local_shuffle_seed if self.local_shuffle_seed is None else self.local_shuffle_seed + i
                     ),
                     prefetch_batches=self.prefetch_batches,
-                ),
+                )),
                 w,
             )
             for i, (ds, w) in enumerate(zip(self.datasets, self.weights))

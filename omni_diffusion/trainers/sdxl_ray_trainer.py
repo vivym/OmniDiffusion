@@ -110,7 +110,7 @@ def unet_attn_processors_state_dict(unet: UNet2DConditionModel) -> dict[str, tor
 
 
 def compute_vae_encodings(batch, vae: AutoencoderKL) -> torch.Tensor:
-    pixel_values = batch.pop("pixel_values")
+    pixel_values = batch.pop("image")
 
     with torch.no_grad():
         model_input = vae.encode(pixel_values).latent_dist.sample()
@@ -237,7 +237,7 @@ class SDXLRayTrainer(BaseTrainer):
 
         train_dataloader = MultiSourceDataLoader(
             batch_size=self.train_batch_size,
-            local_shuffle_buffer_size=256,
+            local_shuffle_buffer_size=128,
             local_shuffle_seed=self.seed,
             prefetch_batches=4,
         )
@@ -569,7 +569,6 @@ class SDXLRayTrainer(BaseTrainer):
                 global_step = int(dir_name.split("-")[1])
 
                 resume_step = global_step * self.gradient_accumulation_steps
-                resume_step = 0
 
         progress_bar = tqdm(
             range(0, self.max_steps),
@@ -585,6 +584,8 @@ class SDXLRayTrainer(BaseTrainer):
 
             train_loss = 0.0
 
+            # TODO: keep aspec ratio within a batch
+            # TODO: quick skip or random block order
             for step, batch in enumerate(train_dataloader):
                 if self.resume_from_checkpoint is not None and epoch == 0 and step < resume_step:
                     if step % self.gradient_accumulation_steps == 0:
@@ -621,7 +622,7 @@ class SDXLRayTrainer(BaseTrainer):
                     noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
 
                     add_time_ids = torch.cat(
-                        [batch["original_sizes"], batch["crop_top_lefts"], batch["target_sizes"]], dim=1
+                        [batch["original_size"], batch["crop_top_left"], batch["target_size"]], dim=1
                     )
 
                     # Predict the noise residual
@@ -683,7 +684,7 @@ class SDXLRayTrainer(BaseTrainer):
                         else:
                             params_to_clip = unet.parameters()
 
-                        accelerator.clip_grad_norm_(params_to_clip, self.max_grad_norm)
+                        accelerator.clip_grad_norm_(params_to_clip, self.gradient_clipping)
 
                     optimizer.step()
                     lr_scheduler.step()
