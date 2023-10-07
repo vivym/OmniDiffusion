@@ -24,6 +24,10 @@ class DataConfig:
 
     multi_aspect_training: bool = False
 
+    local_shuffle_buffer_size: int = 128
+
+    prefetch_batches: int = 4
+
 
 @dataclass
 class ModelConfig:
