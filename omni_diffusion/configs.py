@@ -22,11 +22,11 @@ class DataConfig:
     # Proportion of image prompts to be replaced with empty strings. Defaults to 0 (no prompt replacement).
     proportion_empty_prompts: float = 0.0
 
-    multi_aspect_training: bool = False
+    multi_aspect_training: bool = True
 
-    local_shuffle_buffer_size: int = 128
+    local_shuffle_buffer_size: int | None = None
 
-    prefetch_batches: int = 4
+    prefetch_batches: int = 1
 
 
 @dataclass
@@ -34,6 +34,8 @@ class ModelConfig:
     model_name_or_path: str
 
     revision: str | None = None
+
+    unet_checkpoint_path: str | None = None
 
 
 @dataclass

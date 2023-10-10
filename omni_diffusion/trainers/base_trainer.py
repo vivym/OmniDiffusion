@@ -41,6 +41,7 @@ from transformers import AutoTokenizer, PretrainedConfig, PreTrainedModel
 from transformers.utils import ContextManagers
 from tqdm import tqdm
 from torch.nn import functional as F
+from torch.utils.data import DataLoader
 from torchvision.transforms import functional as TrF, InterpolationMode
 
 from omni_diffusion.configs import (
@@ -141,7 +142,10 @@ class BaseTrainer(abc.ABC):
         lora_rank: int = 4,
         train_text_encoder: bool = False,
         use_deepspeed: bool = False,
-        pipeline_cls: str = "StableDiffusionPipeline"
+        pipeline_cls: str = "StableDiffusionPipeline",
+        num_ddim_steps: int = 64,
+        guidance_rescale: float = 0.0,
+        cfg_aware_distillation_prob: float = 0.2,
     ) -> None:
         self.project_name = project_name
         self.output_dir = os.path.realpath(output_dir)
@@ -180,6 +184,11 @@ class BaseTrainer(abc.ABC):
         else:
             raise ValueError(f"Unknown pipeline_cls: {pipeline_cls}")
 
+        # For step distillation
+        self.num_ddim_steps = num_ddim_steps
+        self.guidance_rescale = guidance_rescale
+        self.cfg_aware_distillation_prob = cfg_aware_distillation_prob
+
         # Data config
         self.dataset_name_or_path: str | None = None
         self.dataset_revision: str | None = None
@@ -197,6 +206,7 @@ class BaseTrainer(abc.ABC):
         # Model config
         self.model_name_or_path: str | None = None
         self.model_revision: str | None = None
+        self.unet_checkpoint_path: str | None = None
 
         # Optimizer config
         self.learning_rate: float | None = None
@@ -256,6 +266,9 @@ class BaseTrainer(abc.ABC):
             "use_deepspeed": self.use_deepspeed,
             "pipeline_cls": pipeline_cls,
             "num_text_encoders": self.num_text_encoders,
+            "num_ddim_steps": self.num_ddim_steps,
+            "guidance_rescale": self.guidance_rescale,
+            "cfg_aware_distillation_prob": self.cfg_aware_distillation_prob,
         }
 
     def prepare_configs(
@@ -291,6 +304,7 @@ class BaseTrainer(abc.ABC):
         # Model config
         self.model_name_or_path = model_config.model_name_or_path
         self.model_revision = model_config.revision
+        self.unet_checkpoint_path = model_config.unet_checkpoint_path
 
         # Optimizer config
         self.learning_rate = optimizer_config.learning_rate
@@ -329,6 +343,7 @@ class BaseTrainer(abc.ABC):
             # Model config
             "model_name_or_path": self.model_name_or_path,
             "model_revision": self.model_revision,
+            "unet_checkpoint_path": self.unet_checkpoint_path,
             # Optimizer config
             "learning_rate": self.learning_rate,
             "auto_scale_lr": self.auto_scale_lr,
@@ -365,6 +380,7 @@ class BaseTrainer(abc.ABC):
 
         datasets = {}
         dataset_metas = {}
+
         for sub_path in sub_paths:
             match = re.match("^([0-9]+)_([0-9]+)_([0-9]+)$", sub_path.stem)
             if match:
@@ -393,7 +409,7 @@ class BaseTrainer(abc.ABC):
                 select_prompt,
                 prompt_columns=self.prompt_columns,
                 proportion_empty_prompts=self.proportion_empty_prompts,
-            ))
+            ), num_cpus=1)
 
             ds = ds.drop_columns([p for p in self.prompt_columns if p != "prompt"])
 
@@ -406,7 +422,7 @@ class BaseTrainer(abc.ABC):
                 target_size=target_size,
                 center_crop=self.center_crop,
                 random_flip=self.random_flip,
-            ))
+            ), num_cpus=1)
 
             datasets[sub_path.stem] = ds
             dataset_metas[sub_path.stem] = {
@@ -428,6 +444,7 @@ class BaseTrainer(abc.ABC):
                 "num_tokenizers": self.num_text_encoders,
             },
             compute=ray.data.ActorPoolStrategy(size=self.num_dataset_workers),
+            batch_size=256,
         )
 
         return ds
@@ -618,11 +635,15 @@ class BaseTrainer(abc.ABC):
                 subfolder="vae",
             )
 
-        unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(
-            self.model_name_or_path,
-            revision=self.model_revision,
-            subfolder="unet",
-        )
+        if self.unet_checkpoint_path is not None:
+            unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(self.unet_checkpoint_path)
+            accelerator.print(f"Loaded UNet from {self.unet_checkpoint_path}.")
+        else:
+            unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(
+                self.model_name_or_path,
+                revision=self.model_revision,
+                subfolder="unet",
+            )
 
         # Freeze vae and text encoders.
         vae.requires_grad_(False)
@@ -672,6 +693,7 @@ class BaseTrainer(abc.ABC):
                 model_cls=UNet2DConditionModel,
                 model_config=ema_unet_base.config,
             )
+            ema_unet.to(accelerator.device)
         else:
             ema_unet = None
 
@@ -820,9 +842,15 @@ class BaseTrainer(abc.ABC):
 
             def load_model_hook(models: list[UNet2DConditionModel], input_dir: str):
                 if self.use_ema:
-                    loaded_model = EMAModel.from_pretrained(
-                        os.path.join(input_dir, "unet_ema"), UNet2DConditionModel
-                    )
+                    ema_dir = os.path.join(input_dir, "unet_ema")
+                    if os.path.exists(ema_dir):
+                        loaded_model = EMAModel.from_pretrained(
+                            os.path.join(input_dir, "unet_ema"), UNet2DConditionModel
+                        )
+                    else:
+                        loaded_model = EMAModel.from_pretrained(
+                            os.path.join(input_dir, "unet"), UNet2DConditionModel
+                        )
                     ema_unet.load_state_dict(loaded_model.state_dict())
                     ema_unet.to(accelerator.device)
                     del loaded_model
@@ -883,6 +911,9 @@ class BaseTrainer(abc.ABC):
             unet, optimizer, lr_scheduler
         )
 
+        if isinstance(train_dataloader, DataLoader):
+            train_dataloader = accelerator.prepare(train_dataloader)
+
         if self.train_text_encoder:
             text_encoders = [
                 accelerator.prepare(text_encoder)
@@ -936,7 +967,7 @@ class BaseTrainer(abc.ABC):
                 resume_step = global_step * self.gradient_accumulation_steps
 
         progress_bar = tqdm(
-            range(0, self.max_steps),
+            range(global_step, self.max_steps),
             desc="Steps",
             disable=not accelerator.is_local_main_process,
         )
@@ -953,9 +984,10 @@ class BaseTrainer(abc.ABC):
             # TODO: quick skip or random block order
             for step, batch in enumerate(train_dataloader):
                 if self.resume_from_checkpoint is not None and epoch == 0 and step < resume_step:
-                    if step % self.gradient_accumulation_steps == 0:
-                        progress_bar.update(1)
-                    continue
+                    # if step % self.gradient_accumulation_steps == 0:
+                    #     progress_bar.update(1)
+                    # continue
+                    ...
 
                 with accelerator.accumulate(unet):
                     loss = self.training_step(
@@ -1058,7 +1090,6 @@ class BaseTrainer(abc.ABC):
 
             if self.use_lora:
                 unet_lora_layers = unet_attn_processors_state_dict(unet)
-
 
                 self.pipeline_cls.save_lora_weights(
                     save_directory=self.output_dir,
@@ -1335,6 +1366,7 @@ def process_image(
     random_flip: bool = False,
 ) -> dict[str, Any]:
     image: Image.Image = Image.open(io.BytesIO(row["image"]))
+    image = image.convert("RGB")
 
     original_size = (image.height, image.width)
     if target_size is None:
@@ -1396,23 +1428,21 @@ def compute_snr(
     return snr
 
 
-def compute_vae_encodings(batch, vae: AutoencoderKL) -> torch.Tensor:
-    pixel_values = batch.pop("image")
-
+def compute_vae_encodings(pixel_values: torch.Tensor, vae: AutoencoderKL) -> torch.Tensor:
     with torch.no_grad():
         model_input = vae.encode(pixel_values).latent_dist.sample()
     return model_input * vae.config.scaling_factor
 
 
 def encode_prompts_sd(
-    batch,
+    input_ids: torch.Tensor,
     text_encoders: list[PreTrainedModel],
     train_text_encoder: bool,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     assert len(text_encoders) == 1, "Only one text encoder is supported for now"
 
     with torch.set_grad_enabled(train_text_encoder):
-        return text_encoders[0](input_ids=batch["input_ids"].to(text_encoders[0].device))[0]
+        return text_encoders[0](input_ids=input_ids)[0]
 
 
 def encode_prompts_sdxl(
@@ -1441,3 +1471,42 @@ def encode_prompts_sdxl(
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1)
 
     return prompt_embeds, pooled_prompt_embeds
+
+
+def compute_diffusion_loss(
+    model_input: torch.Tensor,
+    noise: torch.Tensor,
+    timesteps: torch.Tensor,
+    model_pred: torch.Tensor,
+    noise_scheduler: DDPMScheduler,
+    snr_gamma: float | None = None,
+) -> torch.Tensor:
+    # Get the target for loss depending on the prediction type
+    if noise_scheduler.config.prediction_type == "epsilon":
+        target = noise
+    elif noise_scheduler.config.prediction_type == "v_prediction":
+        target = noise_scheduler.get_velocity(model_input, noise, timesteps)
+    else:
+        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+
+    if snr_gamma is None:
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+    else:
+        # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+        # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+        # This is discussed in Section 4.2 of the same paper.
+        snr = compute_snr(timesteps, noise_scheduler.alphas_cumprod)
+        if noise_scheduler.config.prediction_type == "v_prediction":
+            # Velocity objective requires that we add one to SNR values before we divide by them.
+            snr = snr + 1
+        mse_loss_weights = (
+            torch.stack([snr, snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
+        )
+        # We first calculate the original loss. Then we mean over the non-batch dimensions and
+        # rebalance the sample-wise losses with their respective loss weights.
+        # Finally, we take the mean of the rebalanced loss.
+        loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+        loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+        loss = loss.mean()
+
+    return loss

@@ -15,22 +15,22 @@ data:
 
 model:
   model_name_or_path: nota-ai/bk-sdm-tiny
-  unet_checkpoint_path: /home/mingyang/projs/OmniDiffusion/outputs/bk-sdm-tiny/checkpoint-5000/unet_ema
+  unet_checkpoint_path: /home/mingyang/projs/OmniDiffusion/outputs/bk-sdm-tiny-vpred/checkpoint-10000/unet_ema
 
 optimizer:
   learning_rate: 0.0001
   auto_scale_lr: False
   weight_decay: 1e-2
   lr_scheduler: constant_with_warmup
-  lr_warmup_steps: 1000
+  lr_warmup_steps: 500
 
 trainer:
-  class_path: omni_diffusion.trainers.sd_trainer2.StableDiffusionTrainer
+  class_path: omni_diffusion.trainers.sd_distiller.StableDiffusionStepDistiller
   init_args:
     project_name: "bk-sdm-tiny"
-    output_dir: ./outputs/bk-sdm-tiny-vpred
+    output_dir: ./outputs/bk-sdm-tiny-step-distill-64-32
     num_devices: 8
-    max_steps: 200000
+    max_steps: 10000
     train_batch_size: 64
     validation_every_n_steps: 10000000
     validation_prompt: "cute dragon creature"
@@ -39,7 +39,7 @@ trainer:
     gradient_checkpointing: False
     checkpointing_every_n_steps: 1000
     max_checkpoints: 10
-    seed: 152
+    seed: 62
     use_ema: True
     mixed_precision: fp16
     use_xformers: True
@@ -47,6 +47,9 @@ trainer:
     resume_from_checkpoint: latest
     prediction_type: v_prediction
     snr_gamma: 5.0
+    num_ddim_steps: 64
+    guidance_rescale: 0.7
+    cfg_aware_distillation_prob: 0.2
 
 logging:
   logging_dir: logs

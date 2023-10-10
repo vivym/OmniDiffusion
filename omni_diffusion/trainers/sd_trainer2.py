@@ -1,5 +1,3 @@
-import os
-
 import torch
 from accelerate.logging import get_logger
 from diffusers import (
@@ -8,14 +6,68 @@ from diffusers import (
     UNet2DConditionModel,
 )
 from torch.nn import functional as F
+from torch.utils.data import DataLoader
 from transformers import PreTrainedModel
 
-from .base_trainer import BaseTrainer, compute_snr, compute_vae_encodings, encode_prompts_sdxl
+from omni_diffusion.data.streaming_dataset import MMStreamingDataset
+from .base_trainer import BaseTrainer, compute_snr, compute_vae_encodings, encode_prompts_sd
 
 logger = get_logger(__name__, log_level="INFO")
 
 
-class SDXLRayTrainer(BaseTrainer):
+class StableDiffusionTrainer(BaseTrainer):
+    def setup_dataloader(self):
+        # sub_paths: list[Path] = []
+        # if self.multi_aspect_training:
+        #     for sub_path in Path(self.dataset_name_or_path).glob("*_*"):
+        #         if not sub_path.is_dir():
+        #             continue
+
+        #         sub_paths.append(sub_path.resolve())
+        # else:
+        #     sub_paths.append(Path(self.dataset_name_or_path).resolve())
+
+        # streams: list[Stream] = []
+        # for sub_path in sub_paths:
+        #     match = re.match("^([0-9]+)_([0-9]+)_([0-9]+)$", sub_path.stem)
+        #     if match:
+        #         num_samples = int(match.group(3))
+        #         target_size = (int(match.group(1)), int(match.group(2)))
+
+        #         # TODO: fix me
+        #         if num_samples < 2048:
+        #             continue
+        #     else:
+        #         num_samples = 1
+        #         target_size = None
+
+        #     if self.resolution is not None:
+        #         if isinstance(self.resolution, int):
+        #             target_size = (self.resolution, self.resolution)
+        #         else:
+        #             target_size = self.resolution
+
+        #     Stream(remote=sub_path, proportion=)
+
+        ds = MMStreamingDataset(
+            dataset_path=self.dataset_name_or_path,
+            model_name_or_path=self.model_name_or_path,
+            model_revision=self.model_revision,
+            num_tokenizers=self.num_text_encoders,
+            resolution=self.resolution,
+            proportion_empty_prompts=self.proportion_empty_prompts,
+            center_crop=self.center_crop,
+            random_flip=self.random_flip,
+            shuffle_seed=self.seed,
+        )
+
+        return DataLoader(
+            ds,
+            batch_size=self.train_batch_size,
+            num_workers=self.num_dataset_workers,
+            pin_memory=True,
+        )
+
     def training_step(
         self,
         batch,
@@ -24,7 +76,7 @@ class SDXLRayTrainer(BaseTrainer):
         text_encoders: list[PreTrainedModel],
         noise_scheduler: DDPMScheduler,
     ) -> torch.Tensor:
-        prompt_embeds, pooled_prompt_embeds = encode_prompts_sdxl(
+        prompt_embeds = encode_prompts_sd(
             batch,
             text_encoders=text_encoders,
             train_text_encoder=self.train_text_encoder,
@@ -51,22 +103,7 @@ class SDXLRayTrainer(BaseTrainer):
         # (this is the forward diffusion process)
         noisy_model_input = noise_scheduler.add_noise(model_input, noise, timesteps)
 
-        add_time_ids = torch.cat(
-            [batch["original_size"], batch["crop_top_left"], batch["target_size"]], dim=1
-        )
-
-        # Predict the noise residual
-        unet_added_conditions = {
-            "time_ids": add_time_ids,
-            "text_embeds": pooled_prompt_embeds
-        }
-
-        model_pred = unet(
-            noisy_model_input,
-            timesteps,
-            prompt_embeds,
-            added_cond_kwargs=unet_added_conditions
-        ).sample
+        model_pred = unet(noisy_model_input, timesteps, prompt_embeds).sample
 
         # Get the target for loss depending on the prediction type
         if noise_scheduler.config.prediction_type == "epsilon":
@@ -97,42 +134,3 @@ class SDXLRayTrainer(BaseTrainer):
             loss = loss.mean()
 
         return loss
-
-    def save_model_card(
-        self,
-        repo_id: str,
-        images=None,
-        validation_prompt=None,
-        base_model=str,
-        dataset_name=str,
-        repo_folder=None,
-        vae_path=None,
-    ) -> None:
-        img_str = ""
-        for i, image in enumerate(images):
-            image.save(os.path.join(repo_folder, f"image_{i}.png"))
-            img_str += f"![img_{i}](./image_{i}.png)\n"
-
-        yaml = f"""
----
-license: creativeml-openrail-m
-base_model: {base_model}
-dataset: {dataset_name}
-tags:
-- stable-diffusion-xl
-- stable-diffusion-xl-diffusers
-- text-to-image
-- diffusers
-inference: true
----
-"""
-        model_card = f"""
-# Text-to-image finetuning - {repo_id}
-
-This pipeline was finetuned from **{base_model}** on the **{dataset_name}** dataset. Below are some example images generated with the finetuned pipeline using the following prompt: {validation_prompt}: \n
-{img_str}
-
-Special VAE used for training: {vae_path}.
-"""
-        with open(os.path.join(repo_folder, "README.md"), "w") as f:
-            f.write(yaml + model_card)

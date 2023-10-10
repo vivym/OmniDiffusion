@@ -124,8 +124,8 @@ class OmniCLI:
             hub_config=self.config["hub"],
         )
 
-        datasets = trainer.prepare_data()
-        dataset_names = list(datasets.keys())
+        # datasets = trainer.prepare_data()
+        # dataset_names = list(datasets.keys())
 
         trainer.output_dir = os.path.realpath(trainer.output_dir)
 
@@ -158,8 +158,8 @@ class OmniCLI:
                 trainer_resources={"CPU": 4},
                 resources_per_worker={"CPU": 4, "GPU": 1},
             ),
-            datasets=datasets,
-            dataset_config=RayDataConfig(datasets_to_split=dataset_names),
+            # datasets=datasets,
+            # dataset_config=RayDataConfig(datasets_to_split=dataset_names),
         )
         trainer.fit()
 

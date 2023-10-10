@@ -1,17 +1,20 @@
 data:
-  dataset_name_or_path: ./data/midjourney-v52-mar
+  dataset_name_or_path: /home/mingyang/projs/OmniDiffusion/data/midjourney-v52-mar-mds/1024_1024_018653673
   image_column: image
   prompt_column:
     - improved_prompt
     - prompt
-  num_workers: 8
+  num_workers: 32
+  resolution: 512
   center_crop: False
   random_flip: True
   proportion_empty_prompts: 0.1
   multi_aspect_training: False
+  local_shuffle_buffer_size: 256
+  prefetch_batches: 8
 
 model:
-  model_name_or_path: "nota-ai/bk-sdm-tiny"
+  model_name_or_path: nota-ai/bk-sdm-tiny
 
 optimizer:
   learning_rate: 0.0001
@@ -20,17 +23,17 @@ optimizer:
   lr_scheduler: constant
 
 trainer:
-  class_path: omni_diffusion.trainers.sd_trainer.StableDiffusionTrainer
+  class_path: omni_diffusion.trainers.sd_trainer2.StableDiffusionTrainer
   init_args:
     project_name: "bk-sdm-tiny"
     output_dir: ./outputs/bk-sdm-tiny
     num_devices: 8
     max_steps: 200000
-    train_batch_size: 8
+    train_batch_size: 64
     validation_every_n_steps: 10000000
     validation_prompt: "cute dragon creature"
     num_validation_samples: 0
-    gradient_accumulation_steps: 32
+    gradient_accumulation_steps: 4
     gradient_checkpointing: False
     checkpointing_every_n_steps: 1000
     max_checkpoints: 10

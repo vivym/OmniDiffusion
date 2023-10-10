@@ -23,12 +23,12 @@ class StableDiffusionTrainer(BaseTrainer):
         noise_scheduler: DDPMScheduler,
     ) -> torch.Tensor:
         prompt_embeds = encode_prompts_sd(
-            batch,
+            batch["input_ids"],
             text_encoders=text_encoders,
             train_text_encoder=self.train_text_encoder,
         )
 
-        model_input = compute_vae_encodings(batch, vae)
+        model_input = compute_vae_encodings(batch["image"], vae)
         noise = torch.randn_like(model_input)
         if self.noise_offset:
             # https://www.crosslabs.org//blog/diffusion-with-offset-noise
