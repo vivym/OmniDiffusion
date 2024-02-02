@@ -18,6 +18,7 @@ wandb = "^0.15.9"
 scipy = "^1.11.2"
 deepspeed = "^0.10.3"
 ray = {extras = ["data"], version = "^2.7.0"}
+mosaicml-streaming = "^0.6.0"
 
 
 [build-system]

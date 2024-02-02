@@ -92,7 +92,7 @@ class MMStreamingDataset(StreamingDataset):
         random_flip: bool = False,
         shuffle_seed: int = 42,
     ):
-        cache_path = "/home/mingyang/projs/OmniDiffusion/tmp/cache6"
+        cache_path = "/home/mingyang/projs/OmniDiffusion/tmp/cache16"
 
         # if os.path.exists(cache_path):
         #     shutil.rmtree(cache_path)

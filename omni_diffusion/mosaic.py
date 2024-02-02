@@ -95,26 +95,29 @@ class OmniCLI:
 
         import json
         ray.init(
-            runtime_env={
-                "env_vars": {
-                    "RAY_AIR_LOCAL_CACHE_DIR": os.environ["RAY_AIR_LOCAL_CACHE_DIR"],
-                },
-                "working_dir": ".",
-            },
-            # object_store_memory=700 * 1024 * 1024 * 1024,
-            _system_config={
-                "max_io_workers": 8,
-                "object_spilling_config": json.dumps({
-                    "type": "filesystem",
-                    "params": {
-                        "directory_path": [
-                            "/home/mingyang/tmp",
-                            "/home2/mingyang/tmp",
-                        ],
-                    },
-                }),
-            },
+            # runtime_env={
+            #     "env_vars": {
+            #         # "RAY_AIR_LOCAL_CACHE_DIR": os.environ["RAY_AIR_LOCAL_CACHE_DIR"],
+            #         "CUDA_LAUNCH_BLOCKING": "1",
+            #     },
+            #     # "working_dir": ".",
+            # },
+            # # object_store_memory=700 * 1024 * 1024 * 1024,
+            # _system_config={
+            #     "max_io_workers": 8,
+            #     "object_spilling_config": json.dumps({
+            #         "type": "filesystem",
+            #         "params": {
+            #             "directory_path": [
+            #                 "/home/mingyang/tmp",
+            #                 "/home2/mingyang/tmp",
+            #             ],
+            #         },
+            #     }),
+            # },
         )
+
+        print("Ray initialized.")
 
         trainer.prepare_configs(
             data_config=self.config["data"],

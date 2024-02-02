@@ -77,6 +77,9 @@ class StableDiffusionStepDistiller(BaseTrainer):
         return noise_scheduler, teacher_noise_scheduler
 
     def fit(self):
+        os.environ["RAY_AIR_LOCAL_CACHE_DIR"] = self.output_dir
+        # os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
         if self.allow_tf32:
             torch.backends.cuda.matmul.allow_tf32 = True
 
@@ -105,9 +108,25 @@ class StableDiffusionStepDistiller(BaseTrainer):
             use_fast=True,
         )
 
-        teacher_unet = copy.deepcopy(unet)
-        teacher_unet.to(accelerator.device)
+        if self.mixed_precision == "fp16":
+            weight_dtype = torch.float16
+        elif self.mixed_precision == "bf16":
+            weight_dtype = torch.bfloat16
+        else:
+            weight_dtype = torch.float32
+
+        if self.unet_checkpoint_path is not None:
+            teacher_unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(self.unet_checkpoint_path)
+            accelerator.print(f"Loaded UNet from {self.unet_checkpoint_path}.")
+        else:
+            teacher_unet: UNet2DConditionModel = UNet2DConditionModel.from_pretrained(
+                self.model_name_or_path,
+                revision=self.model_revision,
+                subfolder="unet",
+            )
+
         teacher_unet.requires_grad_(False)
+        teacher_unet.to(accelerator.device, dtype=weight_dtype)
         teacher_unet.eval()
 
         optimizer, lr_scheduler = self.setup_optimizer(params_to_optimize, accelerator=accelerator)
@@ -130,13 +149,6 @@ class StableDiffusionStepDistiller(BaseTrainer):
                 self.project_name,
                 config=self.configs,
             )
-
-        if self.mixed_precision == "fp16":
-            weight_dtype = torch.float16
-        elif self.mixed_precision == "bf16":
-            weight_dtype = torch.bfloat16
-        else:
-            weight_dtype = torch.float32
 
         total_batch_size = self.train_batch_size * accelerator.num_processes * self.gradient_accumulation_steps
 
@@ -308,13 +320,13 @@ class StableDiffusionStepDistiller(BaseTrainer):
         sqrt_alphas_cumprod: torch.Tensor,
         sqrt_one_minus_alphas_cumprod: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        input_ids = batch["input_ids"]
+        input_ids: torch.Tensor = batch["input_ids"]
         bsz = input_ids.shape[0]
 
         do_cfg_aware_distillation = random.random() < self.cfg_aware_distillation_prob
 
         if do_cfg_aware_distillation:
-            cfg_scale = torch.rand(bsz, dtype=torch.float32, device=input_ids.device)
+            cfg_scale = torch.rand(bsz, 1, 1, 1, dtype=torch.float32, device=input_ids.device)
             cfg_scale = cfg_scale * (14 - 2) + 2
 
             uncond_ids = torch.full_like(
@@ -354,7 +366,7 @@ class StableDiffusionStepDistiller(BaseTrainer):
         # teacher_timestep_indices = (timestep_indices + 1) * 2 - 1
         teacher_timestep_indices = timestep_indices * 2
 
-        timesteps = noise_scheduler.timesteps[teacher_timestep_indices]
+        timesteps = noise_scheduler.timesteps[timestep_indices]
         teacher_timesteps = teacher_noise_scheduler.timesteps[teacher_timestep_indices]
         teacher_timesteps_prev = teacher_noise_scheduler.timesteps[teacher_timestep_indices + 1]
 
@@ -376,7 +388,6 @@ class StableDiffusionStepDistiller(BaseTrainer):
         if do_cfg_aware_distillation:
             model_pred_text, model_pred_uncond = model_pred.chunk(2, dim=0)
             model_pred = model_pred_uncond + cfg_scale * (model_pred_text - model_pred_uncond)
-
             model_pred = rescale_noise_cfg(model_pred, model_pred_text, guidance_rescale=self.guidance_rescale)
 
         student_sqrt_alphas_cumprod_t = extract(sqrt_alphas_cumprod, timesteps, model_input.shape)
@@ -386,10 +397,12 @@ class StableDiffusionStepDistiller(BaseTrainer):
             sample = noisy_model_input
 
             # 2 DDIM Diffusion steps
-            for i, t, t_prev in enumerate([
+            for i, (t, t_prev) in enumerate([
                 (teacher_timesteps, teacher_timesteps_prev),
                 (teacher_timesteps_prev, None)
             ]):
+                sample = sample.to(dtype=prompt_embeds.dtype)
+
                 teacher_model_pred = teacher_unet(sample, t, prompt_embeds).sample
 
                 if do_cfg_aware_distillation:
@@ -428,6 +441,9 @@ class StableDiffusionStepDistiller(BaseTrainer):
 
                     distill_target = student_sqrt_alphas_cumprod_t * pred_epsilon - \
                                     student_sqrt_one_minus_alphas_cumprod_t * pred_original_sample
+
+                    if do_cfg_aware_distillation:
+                        distill_target = distill_target[:bsz]
                 else:
                     pred_epsilon = sqrt_alphas_cumprod_t * teacher_model_pred + sqrt_one_minus_alphas_cumprod_t * sample
 
@@ -454,6 +470,9 @@ class StableDiffusionStepDistiller(BaseTrainer):
             mse_loss_weights = (
                 torch.stack([snr, self.snr_gamma * torch.ones_like(timesteps)], dim=1).min(dim=1)[0] / snr
             )
+
+            if do_cfg_aware_distillation:
+                mse_loss_weights = mse_loss_weights[:bsz]
             # We first calculate the original loss. Then we mean over the non-batch dimensions and
             # rebalance the sample-wise losses with their respective loss weights.
             # Finally, we take the mean of the rebalanced loss.
